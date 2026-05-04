@@ -1,0 +1,7 @@
+.direnv/
+.pre-commit-config.yaml
+nimcache/
+tests/test_*
+!tests/*.nim
+*.js
+result

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-everywhere
+          path: ../nim-everywhere
+      - uses: cachix/install-nix-action@v27
+      - run: nix develop --command just test 2>&1 | tee test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-log
+          path: test.log
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-everywhere
+          path: ../nim-everywhere
+      - uses: cachix/install-nix-action@v27
+      - run: nix develop --command just lint 2>&1 | tee lint.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lint-log
+          path: lint.log
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+      - run: nix build .#default 2>&1 | tee nix-build.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nix-build-log
+          path: nix-build.log
