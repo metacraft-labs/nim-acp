@@ -36,9 +36,27 @@ type
   AcpRoundTrip* = proc(request: string): string {.closure.}
   AcpNotify* = proc(notification: string) {.closure.}
   AcpDrain* = proc(): seq[string] {.closure.}
+  AcpNotificationCallback* = proc(notification: string) {.closure, gcsafe.}
+    ## Synchronous per-frame callback invoked by
+    ## :proc:`sendWithStream` for each server-initiated notification
+    ## received while waiting for a matching response.  ``notification``
+    ## is the raw NDJSON frame (one complete JSON-RPC object).  The
+    ## callback runs on the same thread as the reader loop, so it must
+    ## not block on anything that depends on additional ACP frames
+    ## arriving (that would deadlock).
+  AcpStreamRoundTrip* = proc(request: string;
+                             onNotification: AcpNotificationCallback): string
+                       {.closure.}
+    ## Streaming round-trip variant: same contract as :type:`AcpRoundTrip`
+    ## but fires ``onNotification`` for every notification frame that
+    ## arrives before the matching response.  Transports that don't
+    ## support progressive delivery (e.g. fake/in-memory) may invoke the
+    ## callback for buffered notifications after the response — but the
+    ## *return value* remains the response frame.
   SessionUpdateHandler* = proc(update: SessionUpdate) {.closure.}
   AcpClient* = object
     roundTrip*: AcpRoundTrip
+    streamRoundTrip*: AcpStreamRoundTrip
     notify*: AcpNotify
     drainNotifications*: AcpDrain
     subscriptions*: Table[string, seq[SessionUpdateHandler]]
@@ -52,6 +70,19 @@ method sendNotification*(transport: AcpTransport; notification: string) {.base.}
 
 method drain*(transport: AcpTransport): seq[string] {.base.} =
   @[]
+
+method sendWithStream*(transport: AcpTransport; request: string;
+    onNotification: AcpNotificationCallback): string {.base.} =
+  ## Default implementation: fall back to the buffered :proc:`send` and
+  ## (after the response arrives) replay any buffered notifications by
+  ## invoking ``onNotification`` for each.  Transports that can stream
+  ## (e.g. :type:`NativeStdioAcpTransport`) override this to deliver
+  ## notifications progressively as frames arrive.
+  result = transport.send(request)
+  if onNotification == nil:
+    return
+  for frame in transport.drain():
+    onNotification(frame)
 
 method capabilities*(transport: AcpTransport): AcpTransportCapabilities {.base.} =
   AcpTransportCapabilities(kind: atkCustom, requestResponse: true)
@@ -123,10 +154,17 @@ when not defined(js):
     some line
 
   proc pumpUntil(transport: NativeStdioAcpTransport; matchId: string;
-      timeoutMs: int): string =
+      timeoutMs: int;
+      onNotification: AcpNotificationCallback = nil): string =
     ## Read frames until one with ``matchId`` arrives or the timeout
     ## elapses. Non-matching frames are sorted into pending tables. If
     ## ``matchId`` is empty, only drain currently-available bytes.
+    ##
+    ## When ``onNotification`` is non-nil, each notification frame is
+    ## passed to the callback *synchronously* before the response is
+    ## returned.  The notification is ALSO appended to
+    ## ``pendingNotifications`` so :proc:`drain` keeps working — the
+    ## callback is additive, not replacing the buffered drain.
     let deadline = epochTime() + (timeoutMs / 1000)
     while true:
       # First serve any pre-buffered matching response.
@@ -156,8 +194,16 @@ when not defined(js):
             return line
           transport.pendingResponses[frameIdText] = line
         else:
-          # Notification or server-initiated request — buffer for drain.
+          # Notification or server-initiated request — buffer for drain
+          # AND fire the streaming callback if installed.
           transport.pendingNotifications.add line
+          if onNotification != nil:
+            try:
+              onNotification(line)
+            except CatchableError:
+              # Callback exceptions are silently swallowed: a misbehaving
+              # consumer must not break the reader loop.
+              discard
         continue
       # Buffer empty; read more bytes.
       if not transport.childAlive() and transport.readBuffer.len == 0:
@@ -212,6 +258,23 @@ when not defined(js):
     transport.writeFrame(request)
     transport.pumpUntil(id, transport.defaultTimeoutMs)
 
+  method sendWithStream*(transport: NativeStdioAcpTransport;
+      request: string;
+      onNotification: AcpNotificationCallback): string =
+    ## Streaming variant of :proc:`send`.  Writes the request frame and
+    ## reads frames back from the child, invoking ``onNotification``
+    ## *synchronously* for each notification before the matching
+    ## response arrives.  Notifications are also appended to
+    ## ``pendingNotifications`` so existing :proc:`drain` consumers keep
+    ## seeing the same frames.
+    let id = extractRequestId(request)
+    if id.len == 0:
+      raise newException(AcpError,
+        "NativeStdioAcpTransport.sendWithStream requires a JSON-RPC request with an id")
+    transport.writeFrame(request)
+    transport.pumpUntil(id, transport.defaultTimeoutMs,
+                        onNotification = onNotification)
+
   method sendNotification*(transport: NativeStdioAcpTransport;
       notification: string) =
     transport.writeFrame(notification)
@@ -259,6 +322,12 @@ else:
     raise newException(AcpError,
       "native stdio ACP transport is not available on JS")
 
+  method sendWithStream*(transport: NativeStdioAcpTransport;
+      request: string;
+      onNotification: AcpNotificationCallback): string =
+    raise newException(AcpError,
+      "native stdio ACP transport is not available on JS")
+
   method sendNotification*(transport: NativeStdioAcpTransport;
       notification: string) =
     raise newException(AcpError,
@@ -271,21 +340,30 @@ method capabilities*(transport: BrowserMessagePortAcpTransport): AcpTransportCap
 method send*(transport: BrowserMessagePortAcpTransport; request: string): string =
   raise newException(AcpError, "browser message-port ACP host integration is not attached")
 
+method sendWithStream*(transport: BrowserMessagePortAcpTransport;
+    request: string; onNotification: AcpNotificationCallback): string =
+  raise newException(AcpError, "browser message-port ACP host integration is not attached")
+
 method sendNotification*(transport: BrowserMessagePortAcpTransport; notification: string) =
   raise newException(AcpError, "browser message-port ACP host integration is not attached")
 
 proc newAcpClient*(transport: AcpTransport): AcpClient =
   AcpClient(
     roundTrip: proc(request: string): string = transport.send(request),
+    streamRoundTrip: proc(request: string;
+                          onNotification: AcpNotificationCallback): string =
+      transport.sendWithStream(request, onNotification),
     notify: proc(notification: string) = transport.sendNotification(notification),
     drainNotifications: proc(): seq[string] = transport.drain(),
     subscriptions: initTable[string, seq[SessionUpdateHandler]](),
     nextId: 1)
 
 proc newAcpClient*(roundTrip: AcpRoundTrip; drain: AcpDrain = nil;
-    notify: AcpNotify = nil): AcpClient =
+    notify: AcpNotify = nil;
+    streamRoundTrip: AcpStreamRoundTrip = nil): AcpClient =
   AcpClient(
     roundTrip: roundTrip,
+    streamRoundTrip: streamRoundTrip,
     notify: notify,
     drainNotifications: drain,
     subscriptions: initTable[string, seq[SessionUpdateHandler]](),
@@ -365,6 +443,7 @@ proc sendPrompt*(client: var AcpClient; req: PromptRequest): PromptResponse =
     sessionId: response.result{"sessionId"}.getStr(req.sessionId),
     stopReason: parseStopReason(response.result{"stopReason"}.getStr("end_turn")))
 
+
 proc cancel*(client: var AcpClient; sessionId: string) =
   if client.notify == nil:
     raise newException(AcpError, "ACP transport does not support notifications")
@@ -431,3 +510,57 @@ proc drainUpdates*(client: AcpClient): seq[SessionUpdate] =
       let update = updateFromJson(notification.params)
       client.dispatch(update)
       result.add update
+
+proc sendPromptStreaming*(client: var AcpClient; req: PromptRequest;
+    onUpdate: SessionUpdateHandler): PromptResponse =
+  ## Streaming variant of :proc:`sendPrompt`.  Decodes each
+  ## ``session/update`` notification on-the-fly and invokes ``onUpdate``
+  ## with the typed :type:`SessionUpdate` *before* the response arrives,
+  ## then returns the same :type:`PromptResponse` :proc:`sendPrompt`
+  ## would have returned.  Falls back to the buffered round-trip when
+  ## the underlying transport doesn't expose a streaming hook (in which
+  ## case ``onUpdate`` fires after the response, by way of
+  ## ``drainUpdates``).
+  var blocks = newJArray()
+  for item in req.prompt:
+    blocks.add contentBlockToJson(item)
+  let frame = encodeRequest(JsonRpcRequest(
+    id: client.requestId(),
+    rpcMethod: "session/prompt",
+    params: %*{"sessionId": req.sessionId, "prompt": blocks}))
+  let snapshot = client
+  var rawResponse: string
+  if client.streamRoundTrip != nil:
+    let notificationCb: AcpNotificationCallback =
+      proc(raw: string) {.gcsafe.} =
+        try:
+          let note = decodeNotification(raw)
+          if note.rpcMethod == "session/update":
+            let update = updateFromJson(note.params)
+            {.cast(gcsafe).}:
+              snapshot.dispatch(update)
+              if onUpdate != nil:
+                onUpdate(update)
+        except CatchableError:
+          discard
+    rawResponse = client.streamRoundTrip(frame, notificationCb)
+  else:
+    rawResponse = client.roundTrip(frame)
+    # Best-effort fallback: drain any buffered notifications and fire
+    # the callback after the response — preserves ordering even though
+    # delivery is not progressive on this transport.
+    if onUpdate != nil and client.drainNotifications != nil:
+      for raw in client.drainNotifications():
+        try:
+          let note = decodeNotification(raw)
+          if note.rpcMethod == "session/update":
+            let update = updateFromJson(note.params)
+            client.dispatch(update)
+            onUpdate(update)
+        except CatchableError:
+          discard
+  let response = decodeResponse(rawResponse)
+  response.raiseIfError()
+  PromptResponse(
+    sessionId: response.result{"sessionId"}.getStr(req.sessionId),
+    stopReason: parseStopReason(response.result{"stopReason"}.getStr("end_turn")))
