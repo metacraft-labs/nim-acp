@@ -8,7 +8,34 @@ when not defined(js):
     import std/posix
 
 type
+  PendingInjection* = object
+    ## A user message that was queued (via :proc:`injectUserMessage`)
+    ## while a turn was already in flight, or between turns.  Drained
+    ## at the next turn boundary by :proc:`takeQueuedInjections`.
+    text*: string
+    receivedAt*: float       # epochTime() when injected (native);
+                             # 0.0 on JS where epochTime is unavailable
+                             # in the same form.
+  AcpInjectionQueue* = ref object
+    ## Per-session FIFO queue of pending injections, protected by a
+    ## :type:`Lock` on native builds.  Two threads typically touch a
+    ## given queue: the daemon's HTTP handler thread (which appends
+    ## via :proc:`injectUserMessage`) and the campaign's worker
+    ## thread (which drains via :proc:`takeQueuedInjections`).
+    pending*: Table[string, seq[PendingInjection]]
+    when not defined(js):
+      lock*: Lock
+    initialized*: bool
+
   AcpTransport* = ref object of RootObj
+    injectionQueue*: AcpInjectionQueue
+      ## Lazy-initialised on first injection or peek/take.  Lives on
+      ## the base class so any transport (native stdio, in-memory
+      ## fake, browser port, …) inherits the same default queue
+      ## behaviour for free.  Concrete transports MAY override the
+      ## ``inject* / take* / peek*`` methods if they want richer
+      ## semantics (e.g. wire-level interleaving) — see the method
+      ## docs below.
   NativeStdioAcpTransport* = ref object of AcpTransport
     command*: string
     args*: seq[string]
@@ -79,11 +106,22 @@ type
     ## callback for buffered notifications after the response — but the
     ## *return value* remains the response frame.
   SessionUpdateHandler* = proc(update: SessionUpdate) {.closure.}
+  AcpInjectProc* = proc(sessionId, text: string) {.closure.}
+    ## Closure form of :proc:`AcpTransport.injectUserMessage` — wired
+    ## by :proc:`newAcpClient` so :proc:`AcpClient.injectUserMessage`
+    ## can dispatch without re-importing the transport.
+  AcpTakeInjectionsProc* = proc(sessionId: string): seq[PendingInjection]
+                          {.closure.}
+  AcpPeekInjectionsProc* = proc(sessionId: string): seq[PendingInjection]
+                          {.closure.}
   AcpClient* = object
     roundTrip*: AcpRoundTrip
     streamRoundTrip*: AcpStreamRoundTrip
     notify*: AcpNotify
     drainNotifications*: AcpDrain
+    injectUserMessage*: AcpInjectProc
+    takeQueuedInjections*: AcpTakeInjectionsProc
+    peekQueuedInjections*: AcpPeekInjectionsProc
     subscriptions*: Table[string, seq[SessionUpdateHandler]]
     nextId*: int
 
@@ -115,6 +153,103 @@ method capabilities*(transport: AcpTransport): AcpTransportCapabilities {.base.}
 method capabilities*(transport: NativeStdioAcpTransport): AcpTransportCapabilities =
   AcpTransportCapabilities(kind: atkNativeStdio, requestResponse: true,
     notifications: true, eventDrain: true)
+
+# --------------------------------------------------------------------------- #
+#  Inject-prompt primitive (CMP-M3b).
+#
+#  ACP has no wire-level "the user typed something while the agent is
+#  mid-turn" message; the protocol is request/response over
+#  ``session/prompt``.  ``injectUserMessage`` is the client-side
+#  affordance that buffers a follow-up user message keyed by session
+#  id.  The daemon's auto-tick path then drains the queue at the next
+#  turn boundary and folds the injected text into the next prompt.
+#
+#  The queue itself lives on the base :type:`AcpTransport` so every
+#  transport (native stdio, in-memory fake, browser port, …) inherits
+#  the same default semantics for free.  Concrete transports may
+#  override the methods if they want richer behaviour — but
+#  :type:`NativeStdioAcpTransport` (the load-bearing case for CMP-M3b)
+#  is happy with the default.
+# --------------------------------------------------------------------------- #
+
+proc ensureInjectionQueue(transport: AcpTransport): AcpInjectionQueue =
+  ## Lazily attach an :type:`AcpInjectionQueue` to ``transport``.  Safe
+  ## to call from any thread on native because the first call happens
+  ## before any sibling thread can plausibly race (the daemon thread
+  ## that injects can only race the worker thread that drains *after*
+  ## a session id has been published; both call paths funnel through
+  ## this helper which then guards against double-init via the
+  ## ``initialized`` flag).
+  if transport.injectionQueue == nil:
+    var queue = AcpInjectionQueue(pending: initTable[string, seq[PendingInjection]]())
+    when not defined(js):
+      initLock(queue.lock)
+    queue.initialized = true
+    transport.injectionQueue = queue
+  transport.injectionQueue
+
+when not defined(js):
+  template withInjectionLock(queue: AcpInjectionQueue; body: untyped) =
+    acquire(queue.lock)
+    try:
+      body
+    finally:
+      release(queue.lock)
+else:
+  template withInjectionLock(queue: AcpInjectionQueue; body: untyped) =
+    # Single-threaded on JS; no locking needed.
+    body
+
+method injectUserMessage*(transport: AcpTransport;
+    sessionId, text: string) {.base.} =
+  ## Default implementation: append ``text`` to the per-session FIFO
+  ## queue on ``transport``.  Thread-safe (acquires the queue's
+  ## :type:`Lock` on native builds; on JS the call is a no-op around
+  ## the table mutation since there is no concurrency).  Concrete
+  ## transports may override for richer behaviour (e.g. wire-level
+  ## interleaving), but :type:`NativeStdioAcpTransport` inherits this
+  ## default.
+  ##
+  ## ``text`` may be empty; an empty injection is still recorded so
+  ## the caller can use it as a "kick" signal.  The drain side
+  ## decides how to fold empty entries into the next prompt.
+  let queue = ensureInjectionQueue(transport)
+  var entry = PendingInjection(text: text)
+  when not defined(js):
+    entry.receivedAt = epochTime()
+  withInjectionLock(queue):
+    if not queue.pending.hasKey(sessionId):
+      queue.pending[sessionId] = @[]
+    queue.pending[sessionId].add entry
+
+method takeQueuedInjections*(transport: AcpTransport;
+    sessionId: string): seq[PendingInjection] {.base.} =
+  ## Atomically drain the queue for ``sessionId`` — returns the
+  ## entries in FIFO order and clears them from the queue.  Called at
+  ## turn boundaries by the daemon.  Returns ``@[]`` if no pending
+  ## injections.  Thread-safe.
+  if transport.injectionQueue == nil:
+    return @[]
+  let queue = transport.injectionQueue
+  withInjectionLock(queue):
+    if queue.pending.hasKey(sessionId):
+      result = queue.pending[sessionId]
+      queue.pending[sessionId] = @[]
+    else:
+      result = @[]
+
+method peekQueuedInjections*(transport: AcpTransport;
+    sessionId: string): seq[PendingInjection] {.base.} =
+  ## Read-only inspection (for logging / debug).  Returns a copy of
+  ## the current queue without draining it.  Thread-safe.
+  if transport.injectionQueue == nil:
+    return @[]
+  let queue = transport.injectionQueue
+  withInjectionLock(queue):
+    if queue.pending.hasKey(sessionId):
+      result = queue.pending[sessionId]
+    else:
+      result = @[]
 
 when not defined(js):
   const
@@ -508,6 +643,12 @@ proc newAcpClient*(transport: AcpTransport): AcpClient =
       transport.sendWithStream(request, onNotification),
     notify: proc(notification: string) = transport.sendNotification(notification),
     drainNotifications: proc(): seq[string] = transport.drain(),
+    injectUserMessage: proc(sessionId, text: string) =
+      transport.injectUserMessage(sessionId, text),
+    takeQueuedInjections: proc(sessionId: string): seq[PendingInjection] =
+      transport.takeQueuedInjections(sessionId),
+    peekQueuedInjections: proc(sessionId: string): seq[PendingInjection] =
+      transport.peekQueuedInjections(sessionId),
     subscriptions: initTable[string, seq[SessionUpdateHandler]](),
     nextId: 1)
 
