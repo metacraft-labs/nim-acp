@@ -114,6 +114,14 @@ type
                           {.closure.}
   AcpPeekInjectionsProc* = proc(sessionId: string): seq[PendingInjection]
                           {.closure.}
+  AcpShutdownProc* = proc() {.closure, gcsafe.}
+    ## Closure form of :proc:`AcpTransport.shutdown` — wired by
+    ## :proc:`newAcpClient` so callers can terminate the underlying
+    ## transport (e.g. kill the spawned ACP child) without holding a
+    ## typed reference to it.  ``nil`` when the client was built from
+    ## raw round-trip closures (the :proc:`newAcpClient` overload that
+    ## takes a :type:`AcpRoundTrip`); in that case it is the
+    ## constructor caller's job to clean up.
   AcpClient* = object
     roundTrip*: AcpRoundTrip
     streamRoundTrip*: AcpStreamRoundTrip
@@ -122,6 +130,7 @@ type
     injectUserMessage*: AcpInjectProc
     takeQueuedInjections*: AcpTakeInjectionsProc
     peekQueuedInjections*: AcpPeekInjectionsProc
+    shutdown*: AcpShutdownProc
     subscriptions*: Table[string, seq[SessionUpdateHandler]]
     nextId*: int
 
@@ -149,6 +158,17 @@ method sendWithStream*(transport: AcpTransport; request: string;
 
 method capabilities*(transport: AcpTransport): AcpTransportCapabilities {.base.} =
   AcpTransportCapabilities(kind: atkCustom, requestResponse: true)
+
+method shutdown*(transport: AcpTransport) {.base, gcsafe.} =
+  ## Release any resources the transport holds (child process, sockets,
+  ## file handles).  Default is a no-op so in-memory and other
+  ## resourceless transports stay no-op; the
+  ## :type:`NativeStdioAcpTransport` override terminates the spawned
+  ## child.  Named ``shutdown`` rather than ``close`` to keep clear of
+  ## :proc:`AsyncSocket.close` / :proc:`Stream.close` calls that show
+  ## up in the same modules; callers above this layer expose ``close``
+  ## as the public verb.
+  discard
 
 method capabilities*(transport: NativeStdioAcpTransport): AcpTransportCapabilities =
   AcpTransportCapabilities(kind: atkNativeStdio, requestResponse: true,
@@ -605,6 +625,14 @@ when not defined(js):
     try: transport.process.close() except CatchableError: discard
     deinitLock(transport.writeLock)
 
+  method shutdown*(transport: NativeStdioAcpTransport) {.gcsafe.} =
+    ## Dispatch-able alias for :proc:`close` so callers that only hold
+    ## an :type:`AcpTransport` reference (or a closure captured by
+    ## :proc:`newAcpClient`) can terminate the child without knowing
+    ## the concrete transport type.
+    {.cast(gcsafe).}:
+      close(transport)
+
 else:
   method send*(transport: NativeStdioAcpTransport; request: string): string =
     raise newException(AcpError,
@@ -649,6 +677,9 @@ proc newAcpClient*(transport: AcpTransport): AcpClient =
       transport.takeQueuedInjections(sessionId),
     peekQueuedInjections: proc(sessionId: string): seq[PendingInjection] =
       transport.peekQueuedInjections(sessionId),
+    shutdown: proc() {.gcsafe.} =
+      {.cast(gcsafe).}:
+        transport.shutdown(),
     subscriptions: initTable[string, seq[SessionUpdateHandler]](),
     nextId: 1)
 
