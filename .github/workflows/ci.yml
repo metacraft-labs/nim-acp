@@ -7,7 +7,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [incus, tart-linux-arm, macos-tart]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -19,10 +23,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-log
+          name: test-log-${{ matrix.runner }}
           path: test.log
   lint:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [incus, tart-linux-arm, macos-tart]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -34,10 +42,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lint-log
+          name: lint-log-${{ matrix.runner }}
           path: lint.log
   nix-build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [incus, tart-linux-arm, macos-tart]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
@@ -45,5 +57,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: nix-build-log
+          name: nix-build-log-${{ matrix.runner }}
           path: nix-build.log
