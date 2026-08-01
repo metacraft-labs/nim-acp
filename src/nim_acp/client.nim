@@ -394,6 +394,10 @@ when not defined(js):
       # let the caller's timeout / childAlive logic decide what to do.
       return none(char)
     else:
+      # Windows process pipes are named pipes. Avoid entering the
+      # blocking stream read until PeekNamedPipe reports a byte ready.
+      if not transport.process.hasData():
+        return none(char)
       var ch: char
       let n = transport.stdoutStream.readData(addr ch, 1)
       if n == 1:

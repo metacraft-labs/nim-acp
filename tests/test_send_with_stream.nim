@@ -25,8 +25,23 @@ proc writeChildScript(path: string; body: string) =
   ## the lines listed in ``body`` on stdout (one ``printf`` per line so
   ## the framing stays under our control).
   writeFile(path, "#!/bin/sh\n" & body & "\n")
-  let p = path
-  discard execShellCmd("chmod +x " & p)
+  when not defined(windows):
+    discard execShellCmd("chmod +x " & path)
+
+proc newChildTransport(scriptPath: string; defaultTimeoutMs = -1;
+    idleTimeoutMs = DefaultNativeStdioTimeoutMs;
+    hardDeadlineMs = DefaultNativeStdioHardDeadlineMs):
+      NativeStdioAcpTransport =
+  when defined(windows):
+    newNativeStdioAcpTransport("bash", @[scriptPath],
+      defaultTimeoutMs = defaultTimeoutMs,
+      idleTimeoutMs = idleTimeoutMs,
+      hardDeadlineMs = hardDeadlineMs)
+  else:
+    newNativeStdioAcpTransport(scriptPath,
+      defaultTimeoutMs = defaultTimeoutMs,
+      idleTimeoutMs = idleTimeoutMs,
+      hardDeadlineMs = hardDeadlineMs)
 
 proc spawnStreamingChild(numNotifications: int; perChunkDelayMs: int = 0):
     NativeStdioAcpTransport =
@@ -43,7 +58,7 @@ proc spawnStreamingChild(numNotifications: int; perChunkDelayMs: int = 0):
       body.add "sleep " & $(perChunkDelayMs.float / 1000.0) & "\n"
   body.add "printf '%s\\n' '" & """{"jsonrpc":"2.0","id":"1","result":{"sessionId":"s","stopReason":"end_turn"}}""" & "'\n"
   writeChildScript(scriptPath, body)
-  result = newNativeStdioAcpTransport(scriptPath, defaultTimeoutMs = 10_000)
+  result = newChildTransport(scriptPath, defaultTimeoutMs = 10_000)
 
 suite "sendWithStream":
 
@@ -123,7 +138,7 @@ proc spawnSilentChild(): NativeStdioAcpTransport =
     "read line\n" &
     "sleep 30\n"
   writeChildScript(scriptPath, body)
-  result = newNativeStdioAcpTransport(scriptPath,
+  result = newChildTransport(scriptPath,
     idleTimeoutMs = 500, hardDeadlineMs = 30_000)
 
 proc spawnIdleResetChild(): NativeStdioAcpTransport =
@@ -143,7 +158,7 @@ proc spawnIdleResetChild(): NativeStdioAcpTransport =
   # ``idleTimeoutMs = 2500`` so each 1500 ms gap stays within budget;
   # the wall-clock total is ~7500 ms which would have tripped any
   # historical single-deadline check around 5–6 s.
-  result = newNativeStdioAcpTransport(scriptPath,
+  result = newChildTransport(scriptPath,
     idleTimeoutMs = 2500, hardDeadlineMs = 30_000)
 
 proc spawnNoisyForeverChild(): NativeStdioAcpTransport =
@@ -160,7 +175,7 @@ proc spawnNoisyForeverChild(): NativeStdioAcpTransport =
     "  sleep 0.05\n" &
     "done\n"
   writeChildScript(scriptPath, body)
-  result = newNativeStdioAcpTransport(scriptPath,
+  result = newChildTransport(scriptPath,
     idleTimeoutMs = 10_000, hardDeadlineMs = 1000)
 
 suite "idle vs hard timeouts (follow-up 1)":

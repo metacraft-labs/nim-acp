@@ -35,7 +35,21 @@ proc newStubTransport(): StubTransport =
 
 proc writeChildScript(path: string; body: string) =
   writeFile(path, "#!/bin/sh\n" & body & "\n")
-  discard execShellCmd("chmod +x " & path)
+  when not defined(windows):
+    discard execShellCmd("chmod +x " & path)
+
+proc newChildTransport(scriptPath: string;
+    idleTimeoutMs = DefaultNativeStdioTimeoutMs;
+    hardDeadlineMs = DefaultNativeStdioHardDeadlineMs):
+      NativeStdioAcpTransport =
+  when defined(windows):
+    newNativeStdioAcpTransport("bash", @[scriptPath],
+      idleTimeoutMs = idleTimeoutMs,
+      hardDeadlineMs = hardDeadlineMs)
+  else:
+    newNativeStdioAcpTransport(scriptPath,
+      idleTimeoutMs = idleTimeoutMs,
+      hardDeadlineMs = hardDeadlineMs)
 
 proc spawnFakeAcpAgent(): NativeStdioAcpTransport =
   ## Spawn a no-op stdio child so we can verify the inherited default
@@ -51,8 +65,8 @@ proc spawnFakeAcpAgent(): NativeStdioAcpTransport =
     "# not actually talk to the child for CMP-M3b, so this stub is fine.\n" &
     "cat > /dev/null\n"
   writeChildScript(scriptPath, body)
-  newNativeStdioAcpTransport(scriptPath, idleTimeoutMs = 30_000,
-                             hardDeadlineMs = 60_000)
+  newChildTransport(scriptPath, idleTimeoutMs = 30_000,
+                    hardDeadlineMs = 60_000)
 
 # --------------------------------------------------------------------------- #
 #  Concurrency-test scaffolding.  Two threads share a single transport;
