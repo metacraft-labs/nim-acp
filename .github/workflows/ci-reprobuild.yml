@@ -27,21 +27,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Capped to linux/x64: eph-linux-x64 is the only ephemeral runner
+          # pool that reliably comes online. The eph-linux-arm64 /
+          # eph-macos-arm64 / eph-win-x64 / eph-win-arm64 pools don't spin up
+          # and 24h-timeout; restore those legs once their pools are live.
           - os: linux
             arch: x64
             runner: eph-linux-x64
-          - os: linux
-            arch: arm64
-            runner: eph-linux-arm64
-          - os: macos
-            arch: arm64
-            runner: eph-macos-arm64
-          - os: windows
-            arch: x64
-            runner: eph-win-x64
-          - os: windows
-            arch: arm64
-            runner: eph-win-arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -71,6 +63,10 @@ jobs:
         with:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
+          # Publish repro build outputs to the fleet binary cache (per-repo
+          # secrets; org-wide secrets aren't readable in private repos).
+          repro-publish-key: ${{ secrets.REPRO_PUBLISH_KEY }}
+          repro-publish-cert: ${{ secrets.REPRO_PUBLISH_CERT }}
 
       - name: repro build
         # Builds the conventional `build` collection declared in
