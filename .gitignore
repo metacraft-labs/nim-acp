@@ -5,3 +5,7 @@ tests/test_*
 !tests/*.nim
 *.js
 result
+
+# reprobuild local workspace state (repro writes .repro/ into member repos
+# too, but its ergonomics fixer only patches the workspace root)
+.repro/
