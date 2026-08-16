@@ -19,7 +19,12 @@ jobs:
           repository: metacraft-labs/nim-everywhere
           path: ../nim-everywhere
       - uses: cachix/install-nix-action@v27
+      # `shell: bash` is load-bearing, not style. The default `run` shell is
+      # `bash -e` WITHOUT pipefail, so `cmd | tee` takes tee's exit status and a
+      # failing command was reported as a passing job. `shell: bash` selects
+      # `bash --noprofile --norc -eo pipefail`.
       - run: nix develop --command just test 2>&1 | tee test.log
+        shell: bash
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -38,7 +43,9 @@ jobs:
           repository: metacraft-labs/nim-everywhere
           path: ../nim-everywhere
       - uses: cachix/install-nix-action@v27
+      # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - run: nix develop --command just lint 2>&1 | tee lint.log
+        shell: bash
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -53,7 +60,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
+      # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - run: nix build .#default 2>&1 | tee nix-build.log
+        shell: bash
       - uses: actions/upload-artifact@v4
         if: always()
         with:
