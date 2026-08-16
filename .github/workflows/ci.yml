@@ -5,6 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# Collapse superseded pull-request runs only.
+#
+# `github.head_ref` is set on `pull_request` and empty everywhere else, so PR
+# runs group per source branch and a new push cancels the run it superseded.
+# Pushes to the mainline branches fall through to `github.run_id`, which is
+# unique per run: each keeps a group of its own and is never cancelled, so the
+# per-commit build history stays complete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
@@ -31,11 +42,13 @@ jobs:
           name: test-log-${{ matrix.runner }}
           path: test.log
   lint:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
-    runs-on: ${{ matrix.runner }}
+    # Lint is architecture-independent: `nim check` is semantic analysis and
+    # `nixfmt --check` is formatting, and this source tree has no OS- or
+    # CPU-conditional compilation that a second architecture would reach.
+    # Running it on three runner classes triplicated identical work, and two
+    # of those classes have served no job since Aug 1, so those legs could
+    # never complete. One leg is the whole of the coverage.
+    runs-on: eph-linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -49,7 +62,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lint-log-${{ matrix.runner }}
+          name: lint-log-eph-linux-x64
           path: lint.log
   nix-build:
     strategy:
