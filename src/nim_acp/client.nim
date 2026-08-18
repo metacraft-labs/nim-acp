@@ -80,6 +80,19 @@ type
     code*: int
     data*: JsonNode
   AcpTransportClosedError* = object of AcpError
+  AcpSessionLoadUnsupportedError* = object of AcpError
+    ## Raised by :proc:`loadSession` when the connected agent did not
+    ## advertise the optional ``loadSession`` capability during
+    ## :proc:`initialize`.
+    ##
+    ## It is a *distinct* type, not a message variant, because callers
+    ## have to tell the two unresolvable-session cases apart and say
+    ## different things about them: "this agent cannot replay sessions
+    ## at all" (this error, and no other session on this agent will load
+    ## either) versus "this particular session is gone" (an
+    ## :type:`AcpServerError` / :type:`AcpError` carrying the agent's own
+    ## message).  Collapsing them would leave a UI unable to explain
+    ## which one happened.
   AcpTransportCapabilities* = object
     kind*: AcpTransportKind
     requestResponse*: bool
@@ -133,6 +146,16 @@ type
     shutdown*: AcpShutdownProc
     subscriptions*: Table[string, seq[SessionUpdateHandler]]
     nextId*: int
+    agentCapabilities*: AgentCapabilities
+      ## What the agent advertised in its ``initialize`` response.
+      ## Meaningful only when :field:`capabilitiesNegotiated` is true —
+      ## the zero value is "everything off", which must not be mistaken
+      ## for an agent that answered and said no.
+    capabilitiesNegotiated*: bool
+      ## True once :proc:`initialize` has completed a handshake on this
+      ## client.  ACP requires ``initialize`` before any other method, so
+      ## this doubles as the guard that stops an optional method being
+      ## issued against an agent whose capabilities are simply unknown.
 
 method send*(transport: AcpTransport; request: string): string {.base.} =
   raise newException(AcpError, "AcpTransport.send is not implemented")
@@ -729,7 +752,10 @@ proc parseCapabilities(node: JsonNode): AgentCapabilities =
     permissions: node{"permissions"}.getBool(false),
     terminal: node{"terminal"}.getBool(false),
     filesystemRead: node{"filesystem"}{"readTextFile"}.getBool(false),
-    filesystemWrite: node{"filesystem"}{"writeTextFile"}.getBool(false))
+    filesystemWrite: node{"filesystem"}{"writeTextFile"}.getBool(false),
+    # Optional in ACP; absent means "cannot replay sessions", which is
+    # exactly the ``false`` default.
+    loadSession: node{"loadSession"}.getBool(false))
 
 proc initialize*(client: var AcpClient; req: InitializeRequest): InitializeResponse =
   let params = %*{
@@ -746,10 +772,15 @@ proc initialize*(client: var AcpClient; req: InitializeRequest): InitializeRespo
   let response = decodeResponse(client.roundTrip(encodeRequest(JsonRpcRequest(
     id: client.requestId(), rpcMethod: "initialize", params: params))))
   response.raiseIfError()
-  InitializeResponse(
+  result = InitializeResponse(
     protocolVersion: response.result{"protocolVersion"}.getInt(1),
     agentCapabilities: parseCapabilities(response.result{"agentCapabilities"}),
     rawMeta: response.result{"_meta"})
+  # Remember the handshake: optional methods (``session/load``) are
+  # gated on it, and the caller should not have to carry the response
+  # around to use them.
+  client.agentCapabilities = result.agentCapabilities
+  client.capabilitiesNegotiated = true
 
 proc startSession*(client: var AcpClient; req: NewSessionRequest): NewSessionResponse =
   let response = decodeResponse(client.roundTrip(encodeRequest(JsonRpcRequest(
@@ -893,3 +924,103 @@ proc sendPromptStreaming*(client: var AcpClient; req: PromptRequest;
   PromptResponse(
     sessionId: response.result{"sessionId"}.getStr(req.sessionId),
     stopReason: parseStopReason(response.result{"stopReason"}.getStr("end_turn")))
+
+proc loadSession*(client: var AcpClient; req: LoadSessionRequest;
+    onUpdate: SessionUpdateHandler = nil): LoadSessionResponse =
+  ## Re-open a session the agent already holds and collect the whole
+  ## conversation it replays — the protocol's optional ``session/load``
+  ## (https://agentclientprotocol.com/protocol/session-setup).
+  ##
+  ## The agent answers a load by emitting the session's history as
+  ## ordinary ``session/update`` notifications and *then* responding, so
+  ## this is the same decode path a live prompt turn takes: subscribers
+  ## registered through :proc:`subscribeUpdates` fire, ``onUpdate`` (when
+  ## given) fires per update, and every update is also returned in
+  ## :field:`LoadSessionResponse.updates` so a caller that just wants the
+  ## transcript does not have to install a handler.
+  ##
+  ## *The capability check.*  ``loadSession`` is optional in ACP.  The
+  ## request is refused here, before it reaches the wire, whenever the
+  ## handshake did not advertise it:
+  ##
+  ##   * no handshake at all → :type:`AcpError`.  This is a caller bug
+  ##     (ACP requires ``initialize`` first) and must not be reported as
+  ##     "the agent cannot do this", which would be a guess.
+  ##   * handshake says no → :type:`AcpSessionLoadUnsupportedError`, which
+  ##     a caller can distinguish from the agent's own "no such session".
+  ##
+  ## Refusing locally is deliberate: an agent that does not implement the
+  ## method answers ``-32601 method not found``, a diagnostic that tells a
+  ## user nothing about *why* their session will not open.
+  ##
+  ## Errors from the agent — a pruned session, a workspace mismatch — are
+  ## raised, never flattened into an empty transcript: an empty session
+  ## view reads as "the agent did nothing", which is a different and
+  ## wrong statement.
+  if not client.capabilitiesNegotiated:
+    raise newException(AcpError,
+      "session/load: the agent's capabilities are unknown; call " &
+      "initialize before loading a session")
+  if not client.agentCapabilities.loadSession:
+    raise newException(AcpSessionLoadUnsupportedError,
+      "session/load: the agent does not advertise the loadSession " &
+      "capability, so session '" & req.sessionId & "' cannot be replayed")
+  let frame = encodeRequest(JsonRpcRequest(
+    id: client.requestId(),
+    rpcMethod: "session/load",
+    params: %*{
+      "sessionId": req.sessionId,
+      "cwd": req.cwd,
+      "mcpServers": req.mcpServers}))
+  let sessionId = req.sessionId
+  let snapshot = client
+  var collected: seq[SessionUpdate] = @[]
+  var rawResponse: string
+
+  proc absorb(raw: string) =
+    ## Decode one replayed frame and fan it out.  Shared by the
+    ## streaming and buffered arms so the two cannot disagree about what
+    ## a replayed update is.
+    try:
+      let note = decodeNotification(raw)
+      if note.rpcMethod != "session/update":
+        return
+      var update = updateFromJson(note.params)
+      # A replay frame that omits ``sessionId`` still belongs to the
+      # session that was asked for; stamping it here means a caller
+      # holding several loaded sessions can always tell them apart.
+      if update.sessionId.len == 0:
+        update.sessionId = sessionId
+      snapshot.dispatch(update)
+      collected.add update
+      if onUpdate != nil:
+        onUpdate(update)
+    except CatchableError:
+      # A malformed frame must not abort a load that is otherwise
+      # replaying fine; the transcript is reported short rather than not
+      # at all.
+      discard
+
+  if client.streamRoundTrip != nil:
+    let notificationCb: AcpNotificationCallback =
+      proc(raw: string) {.gcsafe.} =
+        {.cast(gcsafe).}:
+          absorb(raw)
+    rawResponse = client.streamRoundTrip(frame, notificationCb)
+  else:
+    rawResponse = client.roundTrip(frame)
+    # Buffered transports deliver the replay to ``drain`` instead; the
+    # ordering within the burst is preserved either way.
+    if client.drainNotifications != nil:
+      for raw in client.drainNotifications():
+        absorb(raw)
+  let response = decodeResponse(rawResponse)
+  response.raiseIfError()
+  # ACP's ``session/load`` result is ``null``; agents that echo the id
+  # anyway are honoured, and the requested id is the fallback.
+  let resolvedId =
+    if response.result != nil and response.result.kind == JObject:
+      response.result{"sessionId"}.getStr(req.sessionId)
+    else:
+      req.sessionId
+  LoadSessionResponse(sessionId: resolvedId, updates: collected)

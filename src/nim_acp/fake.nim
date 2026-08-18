@@ -1,4 +1,5 @@
 import std/json
+import std/tables
 import nim_acp/[client, jsonrpc, types]
 
 type
@@ -15,6 +16,22 @@ type
     turns*: seq[FakePromptTurn]
     nextTurn*: int
     cancelledSessions*: seq[string]
+    supportsLoadSession*: bool
+      ## Whether this fake advertises the optional ``loadSession``
+      ## capability.  Settable so a test can exercise the *client's*
+      ## refusal path — no real agent can be asked to withhold a
+      ## capability on demand.  Defaults to true, because an agent that
+      ## can replay sessions is the interesting case.
+    transcripts*: Table[string, seq[JsonNode]]
+      ## Per-session history, the way a real agent persists its own.
+      ## Populated by ``session/new`` (empty), appended to by
+      ## ``session/prompt``, and replayed by ``session/load``.  A session
+      ## id with no entry here is *unknown* — which is how a pruned
+      ## session is simulated.
+    loadedSessions*: seq[string]
+      ## Every session id this fake was asked to load, in order.  Lets a
+      ## test assert that a request did (or, for the capability check,
+      ## did **not**) reach the wire.
 
 proc messageChunk*(text: string): JsonNode =
   %*{
@@ -61,10 +78,31 @@ proc defaultTurn(response: string): FakePromptTurn =
   ])
 
 proc newFakeAcpTransport*(scriptedResponse = "fake response"): FakeAcpTransport =
-  FakeAcpTransport(nextSession: 1, turns: @[defaultTurn(scriptedResponse)])
+  FakeAcpTransport(nextSession: 1, turns: @[defaultTurn(scriptedResponse)],
+    supportsLoadSession: true,
+    transcripts: initTable[string, seq[JsonNode]]())
 
 proc newFakeAcpTransport*(turns: seq[FakePromptTurn]): FakeAcpTransport =
-  FakeAcpTransport(nextSession: 1, turns: turns)
+  FakeAcpTransport(nextSession: 1, turns: turns,
+    supportsLoadSession: true,
+    transcripts: initTable[string, seq[JsonNode]]())
+
+proc scriptSession*(transport: FakeAcpTransport; sessionId: string;
+    updates: seq[JsonNode]) =
+  ## Give the fake a session it already holds, without that session
+  ## having been started or prompted through this client.
+  ##
+  ## This is the shape ``session/load`` exists for: a conversation that
+  ## happened *earlier*, in another process, which a later client wants
+  ## to read.  Without it a load test could only ever replay a session it
+  ## had just created, which is the uninteresting half of the feature.
+  transport.transcripts[sessionId] = updates
+
+proc pruneSession*(transport: FakeAcpTransport; sessionId: string) =
+  ## Forget a session the fake holds, simulating an agent that has aged
+  ## its history out.  A subsequent ``session/load`` answers "unknown
+  ## session", which is what the reference-not-resolvable path needs.
+  transport.transcripts.del(sessionId)
 
 method capabilities*(transport: FakeAcpTransport): AcpTransportCapabilities =
   AcpTransportCapabilities(
@@ -90,7 +128,8 @@ method send*(transport: FakeAcpTransport; request: string): string =
           "resources": true,
           "permissions": true,
           "terminal": true,
-          "filesystem": {"readTextFile": true, "writeTextFile": false}
+          "filesystem": {"readTextFile": true, "writeTextFile": false},
+          "loadSession": transport.supportsLoadSession
         },
         "_meta": {"fake": true}
       }
@@ -99,7 +138,29 @@ method send*(transport: FakeAcpTransport; request: string): string =
     let sessionId = "fake-session-" & $transport.nextSession
     inc transport.nextSession
     transport.sessions.add sessionId
+    # A brand-new session is *known* but empty; ``session/load`` must be
+    # able to tell that from a session that was never created.
+    transport.transcripts[sessionId] = @[]
     $(%*{"jsonrpc": "2.0", "id": req.id, "result": {"sessionId": sessionId}})
+  of "session/load":
+    let sessionId = req.params{"sessionId"}.getStr("")
+    if not transport.supportsLoadSession:
+      # What a real agent without the capability answers.  The client is
+      # expected never to get here (it checks the handshake first); the
+      # arm exists so a client that skipped the check is still refused.
+      return $(%*{"jsonrpc": "2.0", "id": req.id, "error": {
+        "code": -32601, "message": "method not found: session/load"}})
+    if not transport.transcripts.hasKey(sessionId):
+      return $(%*{"jsonrpc": "2.0", "id": req.id, "error": {
+        "code": -32602,
+        "message": "unknown session: " & sessionId}})
+    transport.loadedSessions.add sessionId
+    for update in transport.transcripts[sessionId]:
+      transport.notifications.add encodeNotification(JsonRpcNotification(
+        rpcMethod: "session/update",
+        params: %*{"sessionId": sessionId, "update": update}))
+    # ACP's session/load result is null: the replay *is* the payload.
+    $(%*{"jsonrpc": "2.0", "id": req.id, "result": newJNull()})
   of "session/prompt":
     let sessionId = req.params{"sessionId"}.getStr("")
     if transport.nextTurn >= transport.turns.len:
@@ -112,6 +173,12 @@ method send*(transport: FakeAcpTransport; request: string): string =
       transport.notifications.add encodeNotification(JsonRpcNotification(
         rpcMethod: "session/update",
         params: %*{"sessionId": sessionId, "update": update}))
+    # Remember the turn so a later ``session/load`` can replay it, the
+    # way a real agent persists the conversation it just had.
+    if not transport.transcripts.hasKey(sessionId):
+      transport.transcripts[sessionId] = @[]
+    for update in turn.updates:
+      transport.transcripts[sessionId].add update
     $(%*{
       "jsonrpc": "2.0",
       "id": req.id,

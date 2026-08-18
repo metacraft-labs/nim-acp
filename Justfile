@@ -7,26 +7,31 @@ build: build-native build-js
 
 build-native:
     nim c {{paths}} tests/test_acp.nim
+    nim c {{paths}} tests/test_session_load.nim
     nim c {{paths}} tests/test_send_with_stream.nim
     nim c --threads:on {{paths}} tests/test_inject_prompt.nim
 
 build-js:
     nim js {{paths}} tests/test_acp.nim
+    nim js {{paths}} tests/test_session_load.nim
 
 test: test-native test-js
 
 test-native:
     nim c -r {{paths}} tests/test_acp.nim
+    nim c -r {{paths}} tests/test_session_load.nim
     nim c -r {{paths}} tests/test_send_with_stream.nim
     nim c -r --threads:on {{paths}} tests/test_inject_prompt.nim
 
 test-js:
     bash tools/nim-js-test-gate.sh {{paths}} tests/test_acp.nim
+    bash tools/nim-js-test-gate.sh {{paths}} tests/test_session_load.nim
 
 lint: lint-nim lint-nix
 
 lint-nim:
     nim check {{paths}} tests/test_acp.nim
+    nim check {{paths}} tests/test_session_load.nim
     nim check {{paths}} tests/test_send_with_stream.nim
     nim check --threads:on {{paths}} tests/test_inject_prompt.nim
 
