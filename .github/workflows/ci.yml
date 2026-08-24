@@ -18,7 +18,12 @@ jobs:
         with:
           repository: metacraft-labs/nim-everywhere
           path: ../nim-everywhere
-      - uses: cachix/install-nix-action@v27
+      # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
+      # client is already shimmed in, so it exits 0 in ~50ms without applying
+      # extra_nix_config, and the next step dies on "experimental Nix feature
+      # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
+      # and then VERIFIES the features are live.
+      - uses: metacraft-labs/nixos-modules/.github/setup-nix@main
       # `shell: bash` is load-bearing, not style. The default `run` shell is
       # `bash -e` WITHOUT pipefail, so `cmd | tee` takes tee's exit status and a
       # failing command was reported as a passing job. `shell: bash` selects
@@ -42,7 +47,12 @@ jobs:
         with:
           repository: metacraft-labs/nim-everywhere
           path: ../nim-everywhere
-      - uses: cachix/install-nix-action@v27
+      # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
+      # client is already shimmed in, so it exits 0 in ~50ms without applying
+      # extra_nix_config, and the next step dies on "experimental Nix feature
+      # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
+      # and then VERIFIES the features are live.
+      - uses: metacraft-labs/nixos-modules/.github/setup-nix@main
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - run: nix develop --command just lint 2>&1 | tee lint.log
         shell: bash
@@ -59,7 +69,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v27
+      # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
+      # client is already shimmed in, so it exits 0 in ~50ms without applying
+      # extra_nix_config, and the next step dies on "experimental Nix feature
+      # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
+      # and then VERIFIES the features are live.
+      - uses: metacraft-labs/nixos-modules/.github/setup-nix@main
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - run: nix build .#default 2>&1 | tee nix-build.log
         shell: bash
