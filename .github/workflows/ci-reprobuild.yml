@@ -33,7 +33,7 @@ jobs:
           # and 24h-timeout; restore those legs once their pools are live.
           - os: linux
             arch: x64
-            runner: eph-linux-x64
+            runner: [self-hosted, linux, x64]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
