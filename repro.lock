@@ -3,7 +3,7 @@ schema = "reprobuild.solved-graph-lock.v2"
 [lock]
 platform = "amd64-linux"
 optimal = false
-inputs_digest = "fnv1a64:a008efa7d567fa0e"
+inputs_digest = "fnv1a64:f67e198da7bd7ffa"
 variants = []
-packages = [{ name = "gcc", version = "12.0.0", source = "gcc" }, { name = "nim", version = "2.0.0", source = "nim" }, { name = "nim_acp", version = "0.1.0", source = "nim_acp" }]
-deps = [{ name = "nim-acp", path = ".", coord_kind = "vcs", url = "", ref = "mcr-stege0-and-fixes", revision = "e5a19b1aa56c719dd6b1445d1337040f5cbc8d7e", integrity = "git-sha1:e5a19b1aa56c719dd6b1445d1337040f5cbc8d7e", version = "", visibility = "public", participation = "", depends = "", groups = "" }]
+packages = [{ name = "gcc", version = "12.0.0", source = "gcc", selection = "selected" }, { name = "nim", version = "2.0.0", source = "nim", selection = "selected" }, { name = "nim_acp", version = "0.1.0", source = "nim_acp", selection = "selected" }]
+deps = [{ name = "nim-acp", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/nim-acp", ref = "dev", revision = "0d3ff2e9c3c1e5a3a14e036fa8a16b1e62d9c79f", integrity = "git-sha1:0d3ff2e9c3c1e5a3a14e036fa8a16b1e62d9c79f", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
