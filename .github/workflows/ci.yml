@@ -23,7 +23,7 @@ jobs:
       # extra_nix_config, and the next step dies on "experimental Nix feature
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
-      - uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
       # `shell: bash` is load-bearing, not style. The default `run` shell is
       # `bash -e` WITHOUT pipefail, so `cmd | tee` takes tee's exit status and a
       # failing command was reported as a passing job. `shell: bash` selects
@@ -52,7 +52,7 @@ jobs:
       # extra_nix_config, and the next step dies on "experimental Nix feature
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
-      - uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - run: nix develop --command just lint 2>&1 | tee lint.log
         shell: bash
@@ -74,7 +74,7 @@ jobs:
       # extra_nix_config, and the next step dies on "experimental Nix feature
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
-      - uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - run: nix build .#default 2>&1 | tee nix-build.log
         shell: bash
