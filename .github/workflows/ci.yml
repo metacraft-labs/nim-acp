@@ -33,7 +33,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-log-${{ matrix.runner }}
+          name: test-log-${{ join(matrix.runner, '-') }}
           path: test.log
   lint:
     strategy:
@@ -59,7 +59,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lint-log-${{ matrix.runner }}
+          name: lint-log-${{ join(matrix.runner, '-') }}
           path: lint.log
   nix-build:
     strategy:
@@ -81,5 +81,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: nix-build-log-${{ matrix.runner }}
+          name: nix-build-log-${{ join(matrix.runner, '-') }}
           path: nix-build.log
