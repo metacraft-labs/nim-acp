@@ -82,6 +82,7 @@
 ## provisioning is required for uses declarations".
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 
 # ``ct_test_nim_unittest`` supplies the ``buildNimUnittest.build(...)``
 # typed tool used by every test BUILD edge below, and the
@@ -110,6 +111,10 @@ const portableTestSpecs: seq[AcpTestSpec] = @[
 ]
 
 package nim_acp:
+  devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
   defaultToolProvisioning "path"
 
   uses:
