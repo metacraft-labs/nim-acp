@@ -10,6 +10,7 @@ build-native:
     nim c {{paths}} tests/test_session_load.nim
     nim c {{paths}} tests/test_send_with_stream.nim
     nim c --threads:on {{paths}} tests/test_inject_prompt.nim
+    nim c {{paths}} tests/test_nimcache_is_worktree_local.nim
 
 build-js:
     nim js {{paths}} tests/test_acp.nim
@@ -22,6 +23,7 @@ test-native:
     nim c -r {{paths}} tests/test_session_load.nim
     nim c -r {{paths}} tests/test_send_with_stream.nim
     nim c -r --threads:on {{paths}} tests/test_inject_prompt.nim
+    nim c -r {{paths}} tests/test_nimcache_is_worktree_local.nim
 
 test-js:
     bash tools/nim-js-test-gate.sh {{paths}} tests/test_acp.nim
@@ -34,6 +36,7 @@ lint-nim:
     nim check {{paths}} tests/test_session_load.nim
     nim check {{paths}} tests/test_send_with_stream.nim
     nim check --threads:on {{paths}} tests/test_inject_prompt.nim
+    nim check {{paths}} tests/test_nimcache_is_worktree_local.nim
 
 lint-nix:
     nixfmt --check flake.nix
