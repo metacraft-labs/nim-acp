@@ -70,11 +70,20 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
+          repro-from-source: "true"
+          repro-build-pin: "76659f5730ecf698b1963c656494d2cb66eb256d"
           gh-token: ${{ steps.ci_token.outputs.token }}
           # Publish repro build outputs to the fleet binary cache (per-repo
           # secrets; org-wide secrets aren't readable in private repos).
           repro-publish-key: ${{ secrets.REPRO_PUBLISH_KEY }}
           repro-publish-cert: ${{ secrets.REPRO_PUBLISH_CERT }}
+
+      - name: Report exact Repro environment
+        run: |
+          pwd
+          git rev-parse HEAD
+          command -v repro
+          repro --version
 
       - name: repro build
         # Builds the conventional `build` collection declared in
