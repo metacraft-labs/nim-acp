@@ -15,6 +15,9 @@ concurrency:
 
 jobs:
   test:
+    defaults:
+      run:
+        working-directory: nim-acp
     strategy:
       fail-fast: false
       matrix:
@@ -22,10 +25,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: nim-acp
       - uses: actions/checkout@v4
         with:
           repository: metacraft-labs/nim-everywhere
-          path: ../nim-everywhere
+          path: nim-everywhere
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
@@ -42,8 +47,11 @@ jobs:
         if: always()
         with:
           name: test-log-${{ join(matrix.runner, '-') }}
-          path: test.log
+          path: nim-acp/test.log
   lint:
+    defaults:
+      run:
+        working-directory: nim-acp
     strategy:
       fail-fast: false
       matrix:
@@ -51,10 +59,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: nim-acp
       - uses: actions/checkout@v4
         with:
           repository: metacraft-labs/nim-everywhere
-          path: ../nim-everywhere
+          path: nim-everywhere
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
@@ -68,8 +78,11 @@ jobs:
         if: always()
         with:
           name: lint-log-${{ join(matrix.runner, '-') }}
-          path: lint.log
+          path: nim-acp/lint.log
   nix-build:
+    defaults:
+      run:
+        working-directory: nim-acp
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +90,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: nim-acp
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
@@ -90,4 +105,4 @@ jobs:
         if: always()
         with:
           name: nix-build-log-${{ join(matrix.runner, '-') }}
-          path: nix-build.log
+          path: nim-acp/nix-build.log
