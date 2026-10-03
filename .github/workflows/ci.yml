@@ -27,10 +27,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: nim-acp
-      - uses: actions/checkout@v4
-        with:
-          repository: metacraft-labs/nim-everywhere
-          path: nim-everywhere
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
@@ -61,10 +57,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: nim-acp
-      - uses: actions/checkout@v4
-        with:
-          repository: metacraft-labs/nim-everywhere
-          path: nim-everywhere
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature

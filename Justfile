@@ -1,7 +1,7 @@
 alias t := test
 alias fmt := format
 
-paths := "--path:src --path:../nim-everywhere/src"
+paths := "--path:src"
 
 build: build-native build-js
 
