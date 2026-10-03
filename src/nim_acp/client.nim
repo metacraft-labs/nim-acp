@@ -320,7 +320,8 @@ when not defined(js):
   proc newNativeStdioAcpTransport*(command: string; args: seq[string] = @[];
       defaultTimeoutMs = -1;
       idleTimeoutMs = DefaultNativeStdioTimeoutMs;
-      hardDeadlineMs = DefaultNativeStdioHardDeadlineMs):
+      hardDeadlineMs = DefaultNativeStdioHardDeadlineMs;
+      allowCommandOverride = true):
         NativeStdioAcpTransport =
     ## Spawn ``command args...`` and prepare a newline-delimited JSON-RPC
     ## pipe pair on its stdin/stdout. ``ISONIM_ACP_AGENT_CMD`` overrides
@@ -349,7 +350,7 @@ when not defined(js):
     ## the idle-reset behaviour.
     var resolvedCommand = command
     let envOverride = getEnv("ISONIM_ACP_AGENT_CMD")
-    if envOverride.len > 0:
+    if allowCommandOverride and envOverride.len > 0:
       resolvedCommand = envOverride
     if resolvedCommand.len == 0:
       raise newException(AcpError,
@@ -783,10 +784,12 @@ proc initialize*(client: var AcpClient; req: InitializeRequest): InitializeRespo
   client.capabilitiesNegotiated = true
 
 proc startSession*(client: var AcpClient; req: NewSessionRequest): NewSessionResponse =
+  var params = %* {"cwd": req.cwd, "mcpServers": req.mcpServers}
+  if req.meta != nil: params["_meta"] = req.meta
   let response = decodeResponse(client.roundTrip(encodeRequest(JsonRpcRequest(
     id: client.requestId(),
     rpcMethod: "session/new",
-    params: %*{"cwd": req.cwd, "mcpServers": req.mcpServers}))))
+    params: params))))
   response.raiseIfError()
   NewSessionResponse(sessionId: response.result{"sessionId"}.getStr(""))
 
