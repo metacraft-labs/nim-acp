@@ -6,12 +6,10 @@
 ## transports. Its ``src/`` tree imports only the Nim stdlib and its own
 ## submodules (``src/nim_acp/{types,jsonrpc,client,fake}.nim`` under the
 ## ``src/nim_acp.nim`` umbrella); nothing under ``src/`` or ``tests/``
-## imports a workspace sibling. The ``--path:../nim-everywhere/src`` that
-## the repo's ``Justfile`` passes is the patched-Nim distribution's own
-## stdlib search root (part of the toolchain floor), not a build
-## dependency on the ``nim-everywhere`` *repo* — no nim-acp module
-## resolves a symbol from it. So the ``uses:`` block is just the
-## toolchain floor and there is no ``uses: "<sibling>"`` edge.
+## imports a workspace sibling. The legacy sibling search path and clone
+## were unused: Nim's stdlib comes from the declared compiler distribution,
+## and full native/JavaScript gates also run with that sibling unavailable.
+## The ``uses:`` block therefore declares only the toolchain floor.
 ##
 ## A Mode 1 / Mode 3 hybrid (per
 ## ``reprobuild-specs/Three-Mode-Convention-System.md``) modelled on the
