@@ -3,7 +3,7 @@ import std/tables
 import nim_acp/[jsonrpc, types]
 
 when not defined(js):
-  import std/[locks, options, os, osproc, streams, strutils, times]
+  import std/[atomics, locks, options, os, osproc, streams, strutils, times]
   when defined(posix):
     import std/posix
 
@@ -16,26 +16,73 @@ type
     receivedAt*: float       # epochTime() when injected (native);
                              # 0.0 on JS where epochTime is unavailable
                              # in the same form.
-  AcpInjectionQueue* = ref object
-    ## Per-session FIFO queue of pending injections, protected by a
-    ## :type:`Lock` on native builds.  Two threads typically touch a
-    ## given queue: the daemon's HTTP handler thread (which appends
-    ## via :proc:`injectUserMessage`) and the campaign's worker
-    ## thread (which drains via :proc:`takeQueuedInjections`).
-    pending*: Table[string, seq[PendingInjection]]
-    when not defined(js):
-      lock*: Lock
-    initialized*: bool
 
+when defined(js):
+  type
+    InjectionQueue = object
+      ## Per-session FIFO queues of pending injections.  JS has no
+      ## shared-memory threads, so a plain value table is enough: an
+      ## all-zero ``Table`` is a valid empty table, so no initialisation
+      ## step exists that could race.
+      pending: Table[string, seq[PendingInjection]]
+else:
+  type
+    InjectionQueueState = object
+      ## The shared part of an :type:`InjectionQueue`.  It lives in
+      ## manually managed shared memory (``createShared``), NOT behind
+      ## an ORC ``ref``: ORC reference counts are not atomic, so a
+      ## ``ref`` that two threads copy and destroy concurrently loses
+      ## count updates and is freed while still in use.  That is exactly
+      ## how the earlier ``ref``-based queue crashed under
+      ## ``test_concurrent_inject_take_thread_safe``.  A ``ptr`` has no
+      ## reference count, so reaching the queue from any number of
+      ## threads touches no shared counter.
+      lock: Lock
+      pending {.guard: lock.}: Table[string, seq[PendingInjection]]
+        ## Values are moved in and out under ``lock``.  This is safe
+        ## across threads only because ``PendingInjection`` holds no
+        ## ``ref``: under ORC a string or seq is not reference counted,
+        ## so the copy or move that crosses the lock owns its buffer
+        ## outright.  Adding a ``ref`` field to ``PendingInjection``
+        ## would reintroduce a cross-thread refcount and requires
+        ## ``isolate``-style hand-off instead.
+    InjectionQueue = object
+      ## Owner of one transport's :type:`InjectionQueueState`.  The
+      ## state is created on first injection and published with a
+      ## compare-and-swap, so concurrent first use from several threads
+      ## yields exactly one queue.  It is freed by ``=destroy`` when the
+      ## owning transport is destroyed.  Not copyable: two owners would
+      ## free the state twice.
+      state: Atomic[ptr InjectionQueueState]
+
+  proc `=destroy`(queue: InjectionQueue) =
+    ## Runs when the owning transport is destroyed.  By then no other
+    ## thread may still be calling the queue methods on that transport:
+    ## that would already be a use-after-free of the transport itself,
+    ## which is the caller's lifetime to manage.
+    let state = queue.state.addr[].load(moAcquire)
+    if state != nil:
+      withLock state.lock:
+        # Frees every key, seq and string the table still owns.
+        reset(state.pending)
+      deinitLock(state.lock)
+      deallocShared(state)
+
+  proc `=copy`(dest: var InjectionQueue; source: InjectionQueue) {.error:
+    "an injection queue has exactly one owning transport".}
+  proc `=dup`(source: InjectionQueue): InjectionQueue {.error:
+    "an injection queue has exactly one owning transport".}
+
+type
   AcpTransport* = ref object of RootObj
-    injectionQueue*: AcpInjectionQueue
-      ## Lazy-initialised on first injection or peek/take.  Lives on
-      ## the base class so any transport (native stdio, in-memory
-      ## fake, browser port, …) inherits the same default queue
-      ## behaviour for free.  Concrete transports MAY override the
-      ## ``inject* / take* / peek*`` methods if they want richer
-      ## semantics (e.g. wire-level interleaving) — see the method
-      ## docs below.
+    injectionQueue: InjectionQueue
+      ## Lives on the base class so any transport (native stdio,
+      ## in-memory fake, browser port, …) inherits the same default
+      ## queue behaviour for free.  Private: every access goes through
+      ## ``inject* / take* / peek*`` below, which are the only places
+      ## that know the locking discipline.  Concrete transports MAY
+      ## override those methods if they want richer semantics (e.g.
+      ## wire-level interleaving) — see the method docs below.
   NativeStdioAcpTransport* = ref object of AcpTransport
     command*: string
     args*: seq[string]
@@ -215,84 +262,97 @@ method capabilities*(transport: NativeStdioAcpTransport): AcpTransportCapabiliti
 #  is happy with the default.
 # --------------------------------------------------------------------------- #
 
-proc ensureInjectionQueue(transport: AcpTransport): AcpInjectionQueue =
-  ## Lazily attach an :type:`AcpInjectionQueue` to ``transport``.  Safe
-  ## to call from any thread on native because the first call happens
-  ## before any sibling thread can plausibly race (the daemon thread
-  ## that injects can only race the worker thread that drains *after*
-  ## a session id has been published; both call paths funnel through
-  ## this helper which then guards against double-init via the
-  ## ``initialized`` flag).
-  if transport.injectionQueue == nil:
-    var queue = AcpInjectionQueue(pending: initTable[string, seq[PendingInjection]]())
-    when not defined(js):
-      initLock(queue.lock)
-    queue.initialized = true
-    transport.injectionQueue = queue
-  transport.injectionQueue
-
-when not defined(js):
-  template withInjectionLock(queue: AcpInjectionQueue; body: untyped) =
-    acquire(queue.lock)
-    try:
-      body
-    finally:
-      release(queue.lock)
-else:
-  template withInjectionLock(queue: AcpInjectionQueue; body: untyped) =
-    # Single-threaded on JS; no locking needed.
+when defined(js):
+  template withPendingTable(transport: AcpTransport; create: static bool;
+      pending, body: untyped) =
+    ## Run ``body`` with ``pending`` naming the transport's session table.
+    ## JS is single-threaded, so there is nothing to lock.
+    template pending: untyped = transport.injectionQueue.pending
     body
+else:
+  proc existingQueueState(transport: AcpTransport): ptr InjectionQueueState =
+    ## The published queue state, or ``nil`` if nothing was ever injected.
+    ## The acquire load pairs with the release half of the publishing
+    ## compare-and-swap in :proc:`queueState`, so a non-nil result points
+    ## at a fully initialised lock and table.
+    transport.injectionQueue.state.load(moAcquire)
+
+  proc queueState(transport: AcpTransport): ptr InjectionQueueState =
+    ## The queue state, created and published on first use.  Two threads
+    ## may both find it missing and both build one; the compare-and-swap
+    ## lets exactly one publish, and the loser frees its candidate and
+    ## uses the winner's, so no injection can land in a discarded queue.
+    result = existingQueueState(transport)
+    if result == nil:
+      let candidate = createShared(InjectionQueueState)
+        # Zeroed memory: an all-zero ``Table`` is a valid empty table.
+      initLock(candidate.lock)
+      var published: ptr InjectionQueueState = nil
+      if transport.injectionQueue.state.compareExchange(published, candidate,
+          moAcquireRelease, moAcquire):
+        result = candidate
+      else:
+        deinitLock(candidate.lock)
+        deallocShared(candidate)
+        result = published
+
+  template withPendingTable(transport: AcpTransport; create: static bool;
+      pending, body: untyped) =
+    ## Run ``body`` with ``pending`` naming the transport's session table,
+    ## holding the queue lock.  With ``create = false`` a transport that
+    ## never had an injection skips ``body`` instead of allocating a
+    ## queue just to find it empty.
+    let state = when create: queueState(transport)
+                else: existingQueueState(transport)
+    if state != nil:
+      withLock state.lock:
+        template pending: untyped = state.pending
+        body
 
 method injectUserMessage*(transport: AcpTransport;
     sessionId, text: string) {.base.} =
   ## Default implementation: append ``text`` to the per-session FIFO
-  ## queue on ``transport``.  Thread-safe (acquires the queue's
-  ## :type:`Lock` on native builds; on JS the call is a no-op around
-  ## the table mutation since there is no concurrency).  Concrete
-  ## transports may override for richer behaviour (e.g. wire-level
-  ## interleaving), but :type:`NativeStdioAcpTransport` inherits this
-  ## default.
+  ## queue on ``transport``.  Concrete transports may override for
+  ## richer behaviour (e.g. wire-level interleaving), but
+  ## :type:`NativeStdioAcpTransport` inherits this default.
+  ##
+  ## Thread-safe on native builds, including the very first call on a
+  ## transport: any number of threads may inject, take and peek
+  ## concurrently.  Entries injected by one thread are delivered in
+  ## that thread's call order.  The calls borrow ``transport`` and touch
+  ## no reference count, so the only requirement on the caller is that
+  ## ``transport`` stays alive until every thread has stopped calling.
+  ## On JS there is no concurrency and no locking.
   ##
   ## ``text`` may be empty; an empty injection is still recorded so
   ## the caller can use it as a "kick" signal.  The drain side
   ## decides how to fold empty entries into the next prompt.
-  let queue = ensureInjectionQueue(transport)
   var entry = PendingInjection(text: text)
   when not defined(js):
     entry.receivedAt = epochTime()
-  withInjectionLock(queue):
-    if not queue.pending.hasKey(sessionId):
-      queue.pending[sessionId] = @[]
-    queue.pending[sessionId].add entry
+  withPendingTable(transport, create = true, pending):
+    pending.mgetOrPut(sessionId, @[]).add move(entry)
 
 method takeQueuedInjections*(transport: AcpTransport;
     sessionId: string): seq[PendingInjection] {.base.} =
   ## Atomically drain the queue for ``sessionId`` — returns the
-  ## entries in FIFO order and clears them from the queue.  Called at
-  ## turn boundaries by the daemon.  Returns ``@[]`` if no pending
-  ## injections.  Thread-safe.
-  if transport.injectionQueue == nil:
-    return @[]
-  let queue = transport.injectionQueue
-  withInjectionLock(queue):
-    if queue.pending.hasKey(sessionId):
-      result = queue.pending[sessionId]
-      queue.pending[sessionId] = @[]
-    else:
-      result = @[]
+  ## entries in FIFO order and removes them from the queue, so every
+  ## injected entry is returned by exactly one take.  Called at turn
+  ## boundaries by the daemon.  Returns ``@[]`` if no pending
+  ## injections.  Thread-safe, under the same terms as
+  ## :proc:`injectUserMessage`.
+  withPendingTable(transport, create = false, pending):
+    # ``pop`` moves the seq out and drops the key, so a drained session
+    # leaves nothing behind in the table.
+    discard pending.pop(sessionId, result)
 
 method peekQueuedInjections*(transport: AcpTransport;
     sessionId: string): seq[PendingInjection] {.base.} =
   ## Read-only inspection (for logging / debug).  Returns a copy of
-  ## the current queue without draining it.  Thread-safe.
-  if transport.injectionQueue == nil:
-    return @[]
-  let queue = transport.injectionQueue
-  withInjectionLock(queue):
-    if queue.pending.hasKey(sessionId):
-      result = queue.pending[sessionId]
-    else:
-      result = @[]
+  ## the current queue without draining it.  Thread-safe, under the
+  ## same terms as :proc:`injectUserMessage`.
+  withPendingTable(transport, create = false, pending):
+    result = pending.getOrDefault(sessionId)
 
 when not defined(js):
   const
