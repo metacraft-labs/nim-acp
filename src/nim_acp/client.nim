@@ -320,8 +320,12 @@ method injectUserMessage*(transport: AcpTransport;
   ## transport: any number of threads may inject, take and peek
   ## concurrently.  Entries injected by one thread are delivered in
   ## that thread's call order.  The calls borrow ``transport`` and touch
-  ## no reference count, so the only requirement on the caller is that
-  ## ``transport`` stays alive until every thread has stopped calling.
+  ## no reference count.  The caller must keep ``transport`` alive until
+  ## every thread has stopped calling, and must not copy the transport
+  ## ``ref`` -- or anything holding it, such as an ``AcpClient``'s
+  ## closures -- on two threads at once: ORC reference counts are not
+  ## atomic, so concurrent copies can free the transport early.  Hand a
+  ## worker thread a ``ptr`` or a single owned reference instead.
   ## On JS there is no concurrency and no locking.
   ##
   ## ``text`` may be empty; an empty injection is still recorded so
