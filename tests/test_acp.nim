@@ -1,3 +1,8 @@
+## Protocol dispatch tests use the shipped fake ACP peer / controlled raw-wire
+## round trip only at the external agent boundary. This makes metadata, errors
+## and capability variants deterministic; request encoding/client behavior stay
+## production. Real stdio/HTTP/provider role delivery and inference are covered
+## by the IsoNim editor integration and explicit real-authoring acceptance gate.
 import std/json
 import unittest
 import nim_acp
@@ -85,3 +90,30 @@ suite "nim-acp":
     check limited.stopReason == srMaxTokens
     expect AcpError:
       discard client.sendPrompt(PromptRequest(sessionId: session.sessionId, prompt: @[textBlock("two")]))
+
+
+suite "session/new provider metadata":
+  test "exact optional metadata survives production request encoding":
+    var observed: JsonNode
+    var client = newAcpClient(proc(request: string): string =
+      observed = parseJson(request)
+      $(%* {"jsonrpc": "2.0", "id": observed["id"], "result": {"sessionId": "metadata-session"}}))
+    let metadata = %* {"systemPrompt": {"append": "Role guidance\nUnicode Ω"}, "providerExtension": {"keep": true}}
+    let session = client.startSession(NewSessionRequest(cwd: "/project", mcpServers: @["server"], meta: metadata))
+    check session.sessionId == "metadata-session"
+    check observed["method"].getStr == "session/new"
+    check observed["params"]["cwd"].getStr == "/project"
+    check observed["params"]["mcpServers"][0].getStr == "server"
+    check observed["params"]["_meta"] == metadata
+
+  test "legacy callers omit metadata and send no extra user turn":
+    var calls = 0
+    var observed: JsonNode
+    var client = newAcpClient(proc(request: string): string =
+      inc calls
+      observed = parseJson(request)
+      $(%* {"jsonrpc": "2.0", "id": observed["id"], "result": {"sessionId": "legacy-session"}}))
+    discard client.startSession(NewSessionRequest(cwd: "/project"))
+    check calls == 1
+    check observed["method"].getStr == "session/new"
+    check not observed["params"].hasKey("_meta")
