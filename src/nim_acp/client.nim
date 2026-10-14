@@ -55,7 +55,18 @@ else:
       ## free the state twice.
       state: Atomic[ptr InjectionQueueState]
 
-  proc `=destroy`(queue: InjectionQueue) =
+  # The destroy body is shared across both `=destroy` signatures below.
+  # The by-value `proc =destroy(x: T)` is accepted only under the destructor
+  # GCs (arc/orc/atomicArc/yrc, `defined(gcDestructors)`) and on the JS
+  # backend; refc and `--mm:none` reject it and demand the legacy
+  # `proc =destroy(x: var T)` — see `bindTypeHook`'s `notRefc` test in the
+  # compiler's `semstmts.nim`.  CodeTracer's `ctNative` builds `--mm:refc`,
+  # so a by-value-only hook breaks `ct-binary`.  Provide both forms over one
+  # body so this transport compiles for every consumer regardless of mm,
+  # without losing the move/sink-friendly by-value form where it is accepted.
+  # This mirrors the same split in codetracer-trace-format-nim's
+  # `member_view.nim` (`destroyContainerImageObj`).
+  template destroyInjectionQueue(queue: untyped) =
     ## Runs when the owning transport is destroyed.  By then no other
     ## thread may still be calling the queue methods on that transport:
     ## that would already be a use-after-free of the transport itself,
@@ -67,6 +78,13 @@ else:
         reset(state.pending)
       deinitLock(state.lock)
       deallocShared(state)
+
+  when defined(gcDestructors):
+    proc `=destroy`(queue: InjectionQueue) =
+      destroyInjectionQueue(queue)
+  else:
+    proc `=destroy`(queue: var InjectionQueue) =
+      destroyInjectionQueue(queue)
 
   proc `=copy`(dest: var InjectionQueue; source: InjectionQueue) {.error:
     "an injection queue has exactly one owning transport".}
