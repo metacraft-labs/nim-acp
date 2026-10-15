@@ -215,14 +215,27 @@ method capabilities*(transport: NativeStdioAcpTransport): AcpTransportCapabiliti
 #  is happy with the default.
 # --------------------------------------------------------------------------- #
 
+when not defined(js):
+  # Queue publication and ARC/ORC reference copies must share a native
+  # synchronization boundary; the per-queue lock protects its contents.
+  var injectionQueueReferenceLock: Lock
+  initLock(injectionQueueReferenceLock)
+
+template withInjectionQueueReferenceAccess(body: untyped) =
+  when not defined(js):
+    acquire(injectionQueueReferenceLock)
+    try:
+      block:
+        body
+    finally:
+      release(injectionQueueReferenceLock)
+  else:
+    block:
+      body
+
 proc ensureInjectionQueue(transport: AcpTransport): AcpInjectionQueue =
-  ## Lazily attach an :type:`AcpInjectionQueue` to ``transport``.  Safe
-  ## to call from any thread on native because the first call happens
-  ## before any sibling thread can plausibly race (the daemon thread
-  ## that injects can only race the worker thread that drains *after*
-  ## a session id has been published; both call paths funnel through
-  ## this helper which then guards against double-init via the
-  ## ``initialized`` flag).
+  ## Caller holds the native reference-access lock through publication,
+  ## managed-reference use and destruction; JS is single-threaded.
   if transport.injectionQueue == nil:
     var queue = AcpInjectionQueue(pending: initTable[string, seq[PendingInjection]]())
     when not defined(js):
@@ -256,14 +269,15 @@ method injectUserMessage*(transport: AcpTransport;
   ## ``text`` may be empty; an empty injection is still recorded so
   ## the caller can use it as a "kick" signal.  The drain side
   ## decides how to fold empty entries into the next prompt.
-  let queue = ensureInjectionQueue(transport)
-  var entry = PendingInjection(text: text)
-  when not defined(js):
-    entry.receivedAt = epochTime()
-  withInjectionLock(queue):
-    if not queue.pending.hasKey(sessionId):
-      queue.pending[sessionId] = @[]
-    queue.pending[sessionId].add entry
+  withInjectionQueueReferenceAccess:
+    let queue = ensureInjectionQueue(transport)
+    var entry = PendingInjection(text: text)
+    when not defined(js):
+      entry.receivedAt = epochTime()
+    withInjectionLock(queue):
+      if not queue.pending.hasKey(sessionId):
+        queue.pending[sessionId] = @[]
+      queue.pending[sessionId].add entry
 
 method takeQueuedInjections*(transport: AcpTransport;
     sessionId: string): seq[PendingInjection] {.base.} =
@@ -271,28 +285,30 @@ method takeQueuedInjections*(transport: AcpTransport;
   ## entries in FIFO order and clears them from the queue.  Called at
   ## turn boundaries by the daemon.  Returns ``@[]`` if no pending
   ## injections.  Thread-safe.
-  if transport.injectionQueue == nil:
-    return @[]
-  let queue = transport.injectionQueue
-  withInjectionLock(queue):
-    if queue.pending.hasKey(sessionId):
-      result = queue.pending[sessionId]
-      queue.pending[sessionId] = @[]
-    else:
-      result = @[]
+  withInjectionQueueReferenceAccess:
+    if transport.injectionQueue == nil:
+      return @[]
+    let queue = transport.injectionQueue
+    withInjectionLock(queue):
+      if queue.pending.hasKey(sessionId):
+        result = queue.pending[sessionId]
+        queue.pending[sessionId] = @[]
+      else:
+        result = @[]
 
 method peekQueuedInjections*(transport: AcpTransport;
     sessionId: string): seq[PendingInjection] {.base.} =
   ## Read-only inspection (for logging / debug).  Returns a copy of
   ## the current queue without draining it.  Thread-safe.
-  if transport.injectionQueue == nil:
-    return @[]
-  let queue = transport.injectionQueue
-  withInjectionLock(queue):
-    if queue.pending.hasKey(sessionId):
-      result = queue.pending[sessionId]
-    else:
-      result = @[]
+  withInjectionQueueReferenceAccess:
+    if transport.injectionQueue == nil:
+      return @[]
+    let queue = transport.injectionQueue
+    withInjectionLock(queue):
+      if queue.pending.hasKey(sessionId):
+        result = queue.pending[sessionId]
+      else:
+        result = @[]
 
 when not defined(js):
   const

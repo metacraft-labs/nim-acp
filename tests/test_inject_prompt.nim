@@ -9,12 +9,14 @@
 ##
 ## These tests exercise the contract from the base-class default
 ## (which :type:`NativeStdioAcpTransport` inherits unchanged) and the
-## concurrency promise.
+## concurrency promise. The minimal transport stub isolates these default
+## queue methods because no wire request is part of their contract; the
+## inheritance boundary is separately exercised through a real child agent.
 
 when defined(js):
   {.error: "Inject-prompt tests are native-only.".}
 
-import std/[os, times, locks]
+import std/[os, times, locks, atomics]
 import unittest
 import nim_acp
 
@@ -80,7 +82,7 @@ type
     transport: AcpTransport
     sessionId: string
     iterations: int
-    producerDone: bool
+    producerDone: Atomic[bool]
     drained: seq[string]
     drainedLock: Lock
 
@@ -102,7 +104,7 @@ proc consumerThread() {.thread, gcsafe.} =
         for entry in batch:
           sharedState.drained.add entry.text
         release(sharedState.drainedLock)
-      if sharedState.producerDone:
+      if sharedState.producerDone.load(moAcquire):
         # Producer is done — one final drain to capture anything that
         # landed between the last take and the producerDone flip.
         let tail = sharedState.transport.takeQueuedInjections(
@@ -176,16 +178,18 @@ suite "injectUserMessage queue":
       transport: newStubTransport(),
       sessionId: "sid-concurrent",
       iterations: 1000,
-      producerDone: false,
       drained: @[])
     initLock(sharedState.drainedLock)
+    sharedState.producerDone.store(false, moRelease)
     var producer: Thread[void]
     var consumer: Thread[void]
     createThread(producer, producerThread)
     createThread(consumer, consumerThread)
-    joinThread(producer)
-    sharedState.producerDone = true
-    joinThread(consumer)
+    # Join through an independent descriptor containing only the immutable
+    # exported OS handle; the running thread clears its own core/dataFn.
+    joinThread(Thread[void](sys: producer.sys))
+    sharedState.producerDone.store(true, moRelease)
+    joinThread(Thread[void](sys: consumer.sys))
     deinitLock(sharedState.drainedLock)
     check sharedState.drained.len == sharedState.iterations
     # FIFO per producer thread: msg-0, msg-1, ... msg-999.
