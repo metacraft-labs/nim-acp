@@ -200,6 +200,68 @@ jobs:
         run: |
           nix run .#ci-initial-samples -- --creator-binding "${{ steps.checkout_git.outputs.binding }}"
 
+      - name: Bind explicit Linux Repro runtime source
+        id: linux_runtime
+        if: matrix.os == 'linux'
+        shell: bash
+        env:
+          NIX_CONFIG: access-tokens = github.com=${{ steps.ci_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          own_sha="$(git rev-parse HEAD)"
+          test "$own_sha" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=no)"
+          own_root="$(git rev-parse --show-toplevel)"
+          receipt="$(mktemp -d "$RUNNER_TEMP/acp-repro-runtime-receipt.XXXXXXXXXX")"
+          printf 'receipt_path=%s\n' "$receipt" >> "$GITHUB_OUTPUT"
+          receipt_python_out="$(nix build --no-link --print-out-paths --no-update-lock-file "git+file://$own_root?rev=$own_sha&shallow=1#ci-receipt-python")"
+          test -x "$receipt_python_out/bin/python3"
+          receipt_python="$receipt_python_out/bin/python3"
+          package_json="$receipt/package-raw.json"
+          nix build --no-link --json --no-update-lock-file 'github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d#reprobuild'  > "$package_json"
+          package="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["outputs"]["out"])' "$package_json")"
+          # A self-hosted runner may retain receipts from earlier jobs. Allocate
+          # exclusively and export this job's path without touching prior evidence.
+          printf '%s\n' "$receipt_python_out" > "$receipt/python-output.txt"
+          nix path-info --derivation "$receipt_python_out" > "$receipt/python-derivation.txt"
+          sha256sum "$receipt_python" > "$receipt/python-executable.sha256"
+          "$receipt_python" --version > "$receipt/python-version.txt"
+          "$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(json.dumps({"drvPath":x[0]["drvPath"],"outputs":x[0]["outputs"]},indent=2))' "$package_json" > "$receipt/package.json"
+          test -x "$package/bin/repro"
+          test -x "$package/bin/.repro-wrapped"
+          test -x "$package/bin/.reprobuild-wrapped"
+          test -x "$package/libexec/reprobuild-nix-daemon"
+          printf 'REPROBUILD_REPRO=%s/bin/repro\n' "$package" >> "$GITHUB_ENV"
+          printf 'REPROBUILD_NIX_DAEMON_BIN=%s/libexec/reprobuild-nix-daemon\n' "$package" >> "$GITHUB_ENV"
+          printf '%s/bin\n' "$package" >> "$GITHUB_PATH"
+          nix flake metadata --json --no-update-lock-file 'github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d' > "$receipt/source-raw.json"
+          "$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["locked"]["rev"]=="76659f5730ecf698b1963c656494d2cb66eb256d"; print(json.dumps({"locked":x["locked"],"path":x["path"]},indent=2))' "$receipt/source-raw.json" > "$receipt/source.json"
+          source_root="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["locked"]["rev"]=="76659f5730ecf698b1963c656494d2cb66eb256d"; print(x["path"])' "$receipt/source-raw.json")"
+          nix flake prefetch --json --no-update-lock-file 'github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d' > "$receipt/source-prefetch.json"
+          "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); prefetch=json.load(open(sys.argv[2])); assert metadata["locked"]["rev"]=="76659f5730ecf698b1963c656494d2cb66eb256d"; assert prefetch["storePath"]==metadata["path"]; assert prefetch["hash"]==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/source-prefetch.json"
+          nix hash path --type sha256 --sri "$source_root" > "$receipt/source-realized-nar-hash.txt"
+          "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); assert open(sys.argv[2]).read().strip()==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/source-realized-nar-hash.txt"
+          sha256sum "$source_root/flake.nix" "$source_root/flake.lock" "$package/bin/repro" "$package/bin/.repro-wrapped" "$package/bin/.reprobuild-wrapped" "$package/libexec/reprobuild-nix-daemon" | tee "$receipt/identities.sha256"
+
+          package_drv="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["drvPath"])' "$package_json")"
+          nix derivation show "$package_drv" > "$receipt/package-derivation-raw.json"
+          drv_source="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; d=next(iter(x.values())); from pathlib import PurePosixPath; out=d["outputs"]["out"]["path"]; assert out in (sys.argv[2],PurePosixPath(sys.argv[2]).name); print(d["env"]["src"])' "$receipt/package-derivation-raw.json" "$package")"
+          nix hash path --type sha256 --sri "$drv_source" > "$receipt/package-derivation-source-nar-hash.txt"
+          "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); actual=open(sys.argv[2]).read().strip(); assert actual==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/package-derivation-source-nar-hash.txt"
+
+      - name: Retain Linux runtime source and package identities
+        if: always() && matrix.os == 'linux' && steps.linux_runtime.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-repro-runtime-${{ matrix.arch }}
+          path: ${{ steps.linux_runtime.outputs.receipt_path }}
+          if-no-files-found: warn
+          retention-days: 7
+
+      # Setup consumes Repro to materialize this environment. Acquire the exact
+      # declared Linux package first, including on runners without a release asset.
+
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
@@ -207,7 +269,7 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
-          repro-from-source: "true"
+          repro-from-source: ${{ matrix.os == 'linux' && 'false' || 'true' }}
           repro-build-pin: "76659f5730ecf698b1963c656494d2cb66eb256d"
           gh-token: ${{ steps.ci_token.outputs.token }}
           # Publish repro build outputs to the fleet binary cache (per-repo

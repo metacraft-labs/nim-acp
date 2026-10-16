@@ -46,6 +46,8 @@ proc close*(child: OwnedPosixChild; gracefulMs = 1000; terminalMs = 2000) =
       "Owned ACP process cleanup incomplete: " & osErrorMsg(OSErrorCode(code)))
     failure.errorCode = code
     failure.child = child
+    when defined(acpAdmissionDiagnostics):
+      failure.msg.add "\nACP cleanup observation: " & $admissionSnapshotJson()
     raise failure
 
 proc openOwnedPosixChild*(image: string; args: seq[string]): OwnedPosixChild =

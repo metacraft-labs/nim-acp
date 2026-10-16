@@ -176,6 +176,8 @@
           };
           # Expose the owning constructor without activating its shell hook.
           # The original checkout Git is passed explicitly by the CI step.
+          packages.ci-receipt-python = pkgs.python3;
+          packages.ci-attic-client = pkgs.attic-client;
           packages.ci-initial-samples = pkgs.writeShellScriptBin "nim-acp-initial-samples" ''
             exec ${pkgs.python3}/bin/python3 ${./ci}/initialize-checkout-samples.py ${pkgs.git}/bin/git "$@"
           '';

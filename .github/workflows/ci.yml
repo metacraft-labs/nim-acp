@@ -153,6 +153,13 @@ jobs:
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          nix-github-token: ${{ github.token }}
+          substituter-preflight: fail
       # `shell: bash` is load-bearing, not style. The default `run` shell is
       # `bash -e` WITHOUT pipefail, so `cmd | tee` takes tee's exit status and a
       # failing command was reported as a passing job. `shell: bash` selects
@@ -161,9 +168,42 @@ jobs:
         shell: bash
         run: |
           nix run .#ci-initial-samples -- --creator-binding "${{ steps.checkout_git.outputs.binding }}"
+      - name: Observe Linux kernel limits before the owning phase
+        id: linux_resources_before
+        if: runner.os == 'Linux'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'before',temporary:process.env.RUNNER_TEMP,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
       - id: original_tests
         run: nix develop --command just test 2>&1 | tee test.log
         shell: bash
+      - name: Observe Linux kernel limits after the owning phase
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+          ACP_KERNEL_RECEIPT: ${{ steps.linux_resources_before.outputs.receipt_path }}
+          ACP_KERNEL_DIRECTORY_IDENTITY: ${{ steps.linux_resources_before.outputs.directory_identity }}
+          ACP_KERNEL_BEFORE_SHA256: ${{ steps.linux_resources_before.outputs.snapshot_sha256 }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'after',temporary:process.env.RUNNER_TEMP,receipt:process.env.ACP_KERNEL_RECEIPT,directoryIdentity:process.env.ACP_KERNEL_DIRECTORY_IDENTITY,beforeSHA:process.env.ACP_KERNEL_BEFORE_SHA256,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Retain bounded public Linux kernel observations
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-linux-kernel-${{ github.job }}-${{ runner.arch }}
+          path: |
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
+          if-no-files-found: warn
       - name: Observe native Darwin admission after original test failure
         if: ${{ failure() && runner.os == 'macOS' && steps.original_tests.outcome == 'failure' }}
         run: nix develop --command nim c -r -d:acpAdmissionDiagnostics --nimcache:.nimcache/tests/acp-admission-diagnostic --out:build/test_send_with_stream_admission_diagnostic --path:src tests/test_send_with_stream.nim 2>&1 | tee admission-diagnostic.log
@@ -320,13 +360,53 @@ jobs:
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          nix-github-token: ${{ github.token }}
+          substituter-preflight: fail
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - name: Authenticate and transition initial checkout Git samples
         shell: bash
         run: |
           nix run .#ci-initial-samples -- --creator-binding "${{ steps.checkout_git.outputs.binding }}"
+      - name: Observe Linux kernel limits before the owning phase
+        id: linux_resources_before
+        if: runner.os == 'Linux'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'before',temporary:process.env.RUNNER_TEMP,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
       - run: nix develop --command just lint 2>&1 | tee lint.log
         shell: bash
+      - name: Observe Linux kernel limits after the owning phase
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+          ACP_KERNEL_RECEIPT: ${{ steps.linux_resources_before.outputs.receipt_path }}
+          ACP_KERNEL_DIRECTORY_IDENTITY: ${{ steps.linux_resources_before.outputs.directory_identity }}
+          ACP_KERNEL_BEFORE_SHA256: ${{ steps.linux_resources_before.outputs.snapshot_sha256 }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'after',temporary:process.env.RUNNER_TEMP,receipt:process.env.ACP_KERNEL_RECEIPT,directoryIdentity:process.env.ACP_KERNEL_DIRECTORY_IDENTITY,beforeSHA:process.env.ACP_KERNEL_BEFORE_SHA256,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Retain bounded public Linux kernel observations
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-linux-kernel-${{ github.job }}-${{ runner.arch }}
+          path: |
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -463,9 +543,94 @@ jobs:
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          nix-github-token: ${{ github.token }}
+          substituter-preflight: fail
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - run: nix build .#default 2>&1 | tee nix-build.log
         shell: bash
+      - name: Observe Linux kernel limits before the owning phase
+        id: linux_resources_before
+        if: runner.os == 'Linux'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'before',temporary:process.env.RUNNER_TEMP,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Authenticate exact native managed-hook cache producer
+        id: managed_cache
+        shell: bash
+        env:
+          ACP_ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
+          ACP_ATTIC_ENDPOINT: ${{ vars.ATTIC_ENDPOINT }}
+          ACP_ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ACP_ATTIC_PUBLIC_KEY: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+        run: bash ci/prepare-managed-cache-producer.sh
+      - name: Verify the selected finite cache-client role
+        shell: bash
+        env:
+          ACP_EXPECTED_ATTIC: ${{ steps.managed_cache.outputs.attic_executable }}
+          ACP_RECEIPT_PYTHON: ${{ steps.managed_cache.outputs.python_executable }}
+          ACP_CACHE_RECEIPT: ${{ steps.managed_cache.outputs.receipt_path }}
+        run: |
+          set -euo pipefail
+          selected="$(command -v attic)"
+          test "$selected" = "$ACP_EXPECTED_ATTIC"
+          "$ACP_RECEIPT_PYTHON" -c 'import hashlib,json,sys; from pathlib import Path; p=Path(sys.argv[1]); r=Path(sys.argv[2]); expected=json.loads((r/"identity.json").read_text())["atticExecutableSHA256"]; actual=hashlib.sha256(p.read_bytes()).hexdigest(); assert actual==expected; (r/"selected-client.json").write_text(json.dumps({"selectedExecutable":str(p),"SHA256":actual}))' "$selected" "$ACP_CACHE_RECEIPT"
+      - name: Publish exact managed-hook constructor through the supported finite cache action
+        uses: metacraft-labs/devops-modules/modules/attic-push-flake-outputs@d54ea9d8bc557f92d79382b97460c82e637ce667
+        env:
+          XDG_CONFIG_HOME: ${{ steps.managed_cache.outputs.config_directory }}
+        with:
+          endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          cache: ${{ vars.ATTIC_CACHE }}
+          token: ${{ secrets.ATTIC_TOKEN }}
+          flake: ./nim-acp
+          attributes: managed-hook-constructor
+          extra-nix-args: --no-update-lock-file
+      - name: Observe Linux kernel limits after the owning phase
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+          ACP_KERNEL_RECEIPT: ${{ steps.linux_resources_before.outputs.receipt_path }}
+          ACP_KERNEL_DIRECTORY_IDENTITY: ${{ steps.linux_resources_before.outputs.directory_identity }}
+          ACP_KERNEL_BEFORE_SHA256: ${{ steps.linux_resources_before.outputs.snapshot_sha256 }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'after',temporary:process.env.RUNNER_TEMP,receipt:process.env.ACP_KERNEL_RECEIPT,directoryIdentity:process.env.ACP_KERNEL_DIRECTORY_IDENTITY,beforeSHA:process.env.ACP_KERNEL_BEFORE_SHA256,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Retain bounded public Linux kernel observations
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-linux-kernel-${{ github.job }}-${{ runner.arch }}
+          path: |
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
+          if-no-files-found: warn
+      - name: Retain public managed-hook producer identities
+        if: always() && steps.managed_cache.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-managed-hook-cache-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            ${{ steps.managed_cache.outputs.receipt_path }}/identity.json
+            ${{ steps.managed_cache.outputs.receipt_path }}/selected-client.json
+            ${{ steps.managed_cache.outputs.receipt_path }}/package-raw.json
+            ${{ steps.managed_cache.outputs.receipt_path }}/closure.json
+            ${{ steps.managed_cache.outputs.receipt_path }}/nix-system.txt
+            ${{ steps.managed_cache.outputs.receipt_path }}/repro-version.txt
+          include-hidden-files: true
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         if: always()
         with:

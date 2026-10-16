@@ -39,6 +39,11 @@ struct acp_admission_diagnostic {
   int restore_result, restore_errno, wait_result, wait_errno, wait_code, wait_status;
   long child_pid, wait_pid, session_result, group_result;
   int session_errno, group_errno;
+  int close_attempted, close_stage, close_error, close_signal;
+  int leader_attempted, leader_wait_result, leader_wait_errno, leader_wait_code;
+  long leader_wait_pid, close_child_pid, close_session_result, close_group_result;
+  int close_session_attempted, close_session_errno;
+  int close_group_attempted, close_group_errno;
 };
 static _Thread_local struct acp_admission_diagnostic admission_diagnostic;
 const struct acp_admission_diagnostic *acp_admission_snapshot(void) {
@@ -56,7 +61,11 @@ const char *acp_admission_snapshot_json(void) {
     "\"flagsResult\":%d,\"flagsErrno\":%d,\"nonblockSet\":%d,\"nonblockErrno\":%d,"
     "\"readResult\":%d,\"readErrno\":%d,\"readChildErrno\":%d,\"restoreResult\":%d,\"restoreErrno\":%d,"
     "\"waitResult\":%d,\"waitErrno\":%d,\"waitCode\":%d,\"waitStatus\":%d,\"childPID\":%ld,\"waitPID\":%ld,"
-    "\"sessionResult\":%ld,\"groupResult\":%ld,\"sessionErrno\":%d,\"groupErrno\":%d}",
+    "\"sessionResult\":%ld,\"groupResult\":%ld,\"sessionErrno\":%d,\"groupErrno\":%d,"
+    "\"closeChildPID\":%ld,\"closeAttempted\":%d,\"closeStage\":%d,\"closeError\":%d,\"closeSignal\":%d,"
+    "\"leaderAttempted\":%d,\"leaderWaitResult\":%d,\"leaderWaitErrno\":%d,\"leaderWaitCode\":%d,\"leaderWaitPID\":%ld,"
+    "\"closeSessionAttempted\":%d,\"closeSessionResult\":%ld,\"closeSessionErrno\":%d,"
+    "\"closeGroupAttempted\":%d,\"closeGroupResult\":%ld,\"closeGroupErrno\":%d}",
     d->failure_probe_attempted,d->reader_fd,d->reader_fd_errno,d->reader_fl,d->reader_fl_errno,
     d->writer_fd,d->writer_fd_errno,d->writer_fl,d->writer_fl_errno,
     d->sigchld_query,d->sigchld_errno,d->sigchld_kind,d->sigchld_flags,
@@ -64,7 +73,11 @@ const char *acp_admission_snapshot_json(void) {
     d->flags_result,d->flags_errno,d->nonblock_set,d->nonblock_errno,
     d->read_result,d->read_errno,d->read_child_errno,d->restore_result,d->restore_errno,
     d->wait_result,d->wait_errno,d->wait_code,d->wait_status,d->child_pid,d->wait_pid,
-    d->session_result,d->group_result,d->session_errno,d->group_errno);
+    d->session_result,d->group_result,d->session_errno,d->group_errno,
+    d->close_child_pid,d->close_attempted,d->close_stage,d->close_error,d->close_signal,
+    d->leader_attempted,d->leader_wait_result,d->leader_wait_errno,d->leader_wait_code,d->leader_wait_pid,
+    d->close_session_attempted,d->close_session_result,d->close_session_errno,
+    d->close_group_attempted,d->close_group_result,d->close_group_errno);
   errno=saved;return text;
 }
 static void admission_before_fork(int fds[2]) {
@@ -179,6 +192,25 @@ static int pause_poll(void) {
   if (nanosleep(&ts, NULL) < 0 && errno != EINTR) return errno;
   return 0;
 }
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+static int leader_alive(acp_owned_posix_child *c) {
+  siginfo_t info;
+  if (!c || c->reaped) return -ECHILD;
+  memset(&info, 0, sizeof info);
+  int result;
+  do {
+    result=waitid(P_PID, (id_t)c->pid, &info, WEXITED | WNOHANG | WNOWAIT);
+    admission_diagnostic.leader_attempted++;
+    admission_diagnostic.leader_wait_result=result;
+    admission_diagnostic.leader_wait_errno=result<0?errno:0;
+    admission_diagnostic.leader_wait_code=info.si_code;
+    admission_diagnostic.leader_wait_pid=(long)info.si_pid;
+    if(result>=0)break;
+    if (errno != EINTR) return -errno;
+  } while(result<0);
+  return info.si_pid == 0;
+}
+#else
 static int leader_alive(acp_owned_posix_child *c) {
   siginfo_t info;
   if (!c || c->reaped) return -ECHILD;
@@ -188,6 +220,7 @@ static int leader_alive(acp_owned_posix_child *c) {
   }
   return info.si_pid == 0;
 }
+#endif
 static int wait_alive_until(acp_owned_posix_child *c, long long end) {
   int alive, e;
   long long now;
@@ -394,7 +427,19 @@ int acp_owned_drained(acp_owned_posix_child *c) {
 static int signal_owned_group(acp_owned_posix_child *c, int signal_number) {
   int alive=leader_alive(c);
   if (alive < 0) return -alive;
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_diagnostic.close_signal=signal_number;
+  admission_diagnostic.close_session_attempted=1;
+  admission_diagnostic.close_session_result=(long)getsid(c->pid);
+  admission_diagnostic.close_session_errno=admission_diagnostic.close_session_result<0?errno:0;
+  if(admission_diagnostic.close_session_result!=c->pid)return ECHILD;
+  admission_diagnostic.close_group_attempted=1;
+  admission_diagnostic.close_group_result=(long)getpgid(c->pid);
+  admission_diagnostic.close_group_errno=admission_diagnostic.close_group_result<0?errno:0;
+  if(admission_diagnostic.close_group_result!=c->pid)return ECHILD;
+#else
   if (getsid(c->pid) != c->pid || getpgid(c->pid) != c->pid) return ECHILD;
+#endif
   if (kill(-c->pid, signal_number) < 0 && errno != ESRCH) return errno;
   return 0;
 }
@@ -427,8 +472,14 @@ static int close_quiet(acp_owned_posix_child *c, int graceful_ms, int terminal_m
     c->reaped=1;drop(&c->output);drop(&c->error);return publish_drained(c);
   }
   end=start+graceful_ms;
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_diagnostic.close_stage=1;
+#endif
   alive=wait_alive_until(c,end);
   if (alive < 0) return -alive;
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_diagnostic.close_stage=2;
+#endif
   if ((e=signal_owned_group(c,SIGTERM))) return e;
   start=millis();if(start < 0)return errno;end=start+terminal_ms;
   /* Preserve a real TERM grace period even if the direct leader has already
@@ -440,6 +491,9 @@ static int close_quiet(acp_owned_posix_child *c, int graceful_ms, int terminal_m
   }
   /* The leader still has not been reaped, so this group cannot be a newly
    * recycled group. SIGKILL also handles descendants ignoring SIGTERM. */
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_diagnostic.close_stage=3;
+#endif
   if ((e=signal_owned_group(c,SIGKILL))) return e;
   alive=wait_alive_until(c,end);
   if (alive < 0) return -alive;
@@ -459,7 +513,24 @@ observe_group:
 }
 int acp_owned_close(acp_owned_posix_child *c,int graceful_ms,int terminal_ms) {
   if(!c)return 0;
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_diagnostic.close_child_pid=(long)c->pid;
+  admission_diagnostic.close_attempted=1;
+  admission_diagnostic.close_stage=0;admission_diagnostic.close_error=-2;
+  admission_diagnostic.close_signal=-2;
+  admission_diagnostic.leader_attempted=0;admission_diagnostic.leader_wait_result=-2;
+  admission_diagnostic.leader_wait_errno=0;admission_diagnostic.leader_wait_code=0;
+  admission_diagnostic.leader_wait_pid=0;
+  admission_diagnostic.close_session_attempted=admission_diagnostic.close_group_attempted=0;
+  admission_diagnostic.close_session_result=admission_diagnostic.close_group_result=-2;
+  admission_diagnostic.close_session_errno=admission_diagnostic.close_group_errno=0;
+#endif
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  int e=pthread_mutex_trylock(&c->closer);
+  if(e){admission_diagnostic.close_error=e;return e;}
+#else
   int e=pthread_mutex_trylock(&c->closer);if(e)return e;
+#endif
   long long start=millis();
   if(start<0){e=errno;goto finished;}
   e=pthread_mutex_lock(&c->state);if(e)goto finished;
@@ -478,7 +549,11 @@ int acp_owned_close(acp_owned_posix_child *c,int graceful_ms,int terminal_ms) {
   int remaining=(int)(start+graceful_ms-now);if(remaining<0)remaining=0;
   e=close_quiet(c,remaining,terminal_ms);
 finished:;
-  int unlock=pthread_mutex_unlock(&c->closer);return e?e:unlock;
+  int unlock=pthread_mutex_unlock(&c->closer);
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_diagnostic.close_error=e?e:unlock;
+#endif
+  return e?e:unlock;
 }
 void acp_owned_free(acp_owned_posix_child *c) {
   /* The wrapper owns this immutable handle until its last reference dies.
