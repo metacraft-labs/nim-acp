@@ -67,6 +67,54 @@ module.exports = async function bindCreator({ core, io, root }) {
   ) {
     throw new Error("Creator image changed during binding");
   }
+  // Authenticate creation modes before setup actions can change the process mask.
+  // The factory uses the bound creator and exact current mask; no observed hook
+  // mode is promoted into an admission rule.
+  const creationUmask = process.umask();
+  const hooks = path.join(physicalRoot, ".git", "hooks");
+  const inventory = (directory) => {
+    if (!fs.lstatSync(directory).isDirectory())
+      throw new Error("Non-directory hooks");
+    const rows = {};
+    for (const name of fs.readdirSync(directory).sort()) {
+      if (!name.endsWith(".sample")) throw new Error("Non-sample initial hook");
+      rows[name] = principal(path.join(directory, name));
+    }
+    if (!Object.keys(rows).length)
+      throw new Error("Empty initial hook inventory");
+    return rows;
+  };
+  const original = inventory(hooks);
+  const factory = fs.mkdtempSync(path.join(physicalRoot, ".creator-factory-"));
+  try {
+    execFileSync(image, ["init", factory], {
+      cwd: physicalRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const generated = inventory(path.join(factory, ".git", "hooks"));
+    if (
+      JSON.stringify(Object.keys(original)) !==
+      JSON.stringify(Object.keys(generated))
+    ) {
+      throw new Error("Checkout-time creator factory inventory differs");
+    }
+    for (const name of Object.keys(original)) {
+      if (
+        original[name].sha !== generated[name].sha ||
+        original[name].mode !== generated[name].mode
+      ) {
+        throw new Error("Checkout-time creator factory body or mode differs");
+      }
+    }
+    if (
+      JSON.stringify(inventory(hooks)) !== JSON.stringify(original) ||
+      process.umask() !== creationUmask
+    ) {
+      throw new Error("Checkout-time hooks or creation mask changed");
+    }
+  } finally {
+    fs.rmSync(factory, { recursive: true });
+  }
   const directory = fs.mkdtempSync(
     path.join(process.env.RUNNER_TEMP, "nim-acp-checkout-git-"),
   );
@@ -75,12 +123,13 @@ module.exports = async function bindCreator({ core, io, root }) {
   }
   const destination = path.join(directory, "creator.json");
   const receipt = {
-    schema: "nim-acp-checkout-creator.v1",
+    schema: "nim-acp-checkout-creator.v2",
     statEncoding: "decimal-v1",
     root: physicalRoot,
     creator: image,
     principal: before,
     inheritedExecPath: process.env.GIT_EXEC_PATH ?? null,
+    creationUmask,
     version,
     execPath,
   };

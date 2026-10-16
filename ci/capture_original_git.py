@@ -51,13 +51,15 @@ def read_creator_binding(path):
     value = json.loads(P(path).read_text(), object_pairs_hook=unique_object)
     require(type(value) is dict and set(value) == {
         'schema', 'statEncoding', 'root', 'creator', 'principal',
-        'inheritedExecPath', 'version', 'execPath'}, 'Creator binding fields differ')
-    require(value['schema'] == 'nim-acp-checkout-creator.v1' and
+        'inheritedExecPath', 'version', 'execPath', 'creationUmask'}, 'Creator binding fields differ')
+    require(value['schema'] == 'nim-acp-checkout-creator.v2' and
             value['statEncoding'] == 'decimal-v1', 'Creator binding schema differs')
     for field in ('root', 'creator', 'version', 'execPath'):
         require(type(value[field]) is str and value[field], 'Creator binding text malformed: ' + field)
     require(value['inheritedExecPath'] is None or type(value['inheritedExecPath']) is str,
             'Creator binding exec selector malformed')
+    require(type(value['creationUmask']) is int and 0 <= value['creationUmask'] <= 0o777,
+            'Creator creation umask malformed')
     row = value['principal']
     require(type(row) is dict and set(row) == {'sha', 'mode', 'dev', 'ino'},
             'Creator principal fields differ')
@@ -129,7 +131,8 @@ def capture(root, receipt, creator_binding=None):
     probe_env = dict(env, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
     with tempfile.TemporaryDirectory(prefix='acp-original-git-factory-') as temporary:
         probe = P(temporary)/'probe'
-        subprocess.run([str(image),'init',str(probe)],env=probe_env,check=True,capture_output=True)
+        subprocess.run([str(image),'init',str(probe)],env=probe_env,check=True,capture_output=True,
+                        umask=binding['creationUmask'] if binding else -1)
         factory = inventory(probe/'.git/hooks')
         if factory != before['hooks']:
             # Diagnostic failure must never replace the original refusal.
@@ -164,9 +167,10 @@ def bind_creator(root, destination):
         results[key]=result.stdout.decode().strip()
     require(regular(image)==principal, 'Creator image changed during binding')
     with destination.open('x') as output:
-        json.dump(dict(schema='nim-acp-checkout-creator.v1',statEncoding='decimal-v1',
+        json.dump(dict(schema='nim-acp-checkout-creator.v2',statEncoding='decimal-v1',
             root=str(root),creator=str(image),principal=dict(principal,dev=str(principal['dev']),ino=str(principal['ino'])),
-            inheritedExecPath=os.environ.get('GIT_EXEC_PATH'),**results),output,indent=2)
+            inheritedExecPath=os.environ.get('GIT_EXEC_PATH'),
+            creationUmask=int(subprocess.check_output([sys.executable, '-c', 'import os; print(os.umask(0))'])),**results),output,indent=2)
         output.write('\n')
 
 if __name__ == '__main__':
