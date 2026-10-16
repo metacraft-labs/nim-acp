@@ -6,4 +6,4 @@ optimal = false
 inputs_digest = "fnv1a64:92042a972a671730"
 variants = []
 packages = [{ name = "gcc", version = "12.0.0", source = "gcc", selection = "selected" }, { name = "just", version = "1.0.0", source = "just", selection = "selected" }, { name = "nim", version = "2.0.0", source = "nim", selection = "selected" }, { name = "nim_acp", version = "0.1.0", source = "nim_acp", selection = "selected" }, { name = "node", version = "20.0.0", source = "node", selection = "selected" }]
-deps = [{ name = "nim-acp", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/nim-acp", ref = "", revision = "6184b1f94892720a9aefbaf740bf8e375cf2aec4", integrity = "git-sha1:6184b1f94892720a9aefbaf740bf8e375cf2aec4", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
+deps = [{ name = "nim-acp", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/nim-acp", ref = "", revision = "7f84d3a3a6e46c25778bdf5effba0693ac78eede", integrity = "git-sha1:7f84d3a3a6e46c25778bdf5effba0693ac78eede", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
