@@ -49,7 +49,13 @@ proc openOwnedPosixChild*(image: string; args: seq[string]): OwnedPosixChild =
   defer: deallocCStringArray(argv)
   let code = spawn(image.cstring, argv, nil, getTempDir().cstring, addr result.handle)
   if code != 0:
-    if result.handle != nil: result.close()
+    if result.handle != nil:
+      try:
+        result.close()
+      except OwnedPosixCleanupError as failure:
+        failure.msg.add "\nACP process startup failed with errno " & $code &
+          ": " & osErrorMsg(OSErrorCode(code))
+        raise
     raiseOSError(OSErrorCode(code))
 
 proc isPresent*(child: OwnedPosixChild): bool =
