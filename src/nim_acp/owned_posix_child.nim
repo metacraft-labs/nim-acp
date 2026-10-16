@@ -4,6 +4,11 @@ import std/[os, options, posix]
 {.compile: "owned_posix_child.c".}
 {.passL: "-pthread".}
 const ownedHeader = currentSourcePath().parentDir / "owned_posix_child.h"
+when defined(acpAdmissionDiagnostics):
+  {.passC: "-DACP_ADMISSION_DIAGNOSTICS".}
+  proc admissionSnapshotJson(): cstring
+    {.importc: "acp_admission_snapshot_json", header: ownedHeader.}
+
 type
   NativeOwnedChild {.importc: "acp_owned_posix_child", header: ownedHeader.} = object
   OwnedPosixChildObj = object
@@ -55,8 +60,17 @@ proc openOwnedPosixChild*(image: string; args: seq[string]): OwnedPosixChild =
       except OwnedPosixCleanupError as failure:
         failure.msg.add "\nACP process startup failed with errno " & $code &
           ": " & osErrorMsg(OSErrorCode(code))
+        when defined(acpAdmissionDiagnostics):
+          failure.msg.add "\nACP admission observation: " & $admissionSnapshotJson()
         raise
-    raiseOSError(OSErrorCode(code))
+    when defined(acpAdmissionDiagnostics):
+      try:
+        raiseOSError(OSErrorCode(code))
+      except OSError as failure:
+        failure.msg.add "\nACP admission observation: " & $admissionSnapshotJson()
+        raise
+    else:
+      raiseOSError(OSErrorCode(code))
 
 proc isPresent*(child: OwnedPosixChild): bool =
   if child == nil or child.handle == nil: return false

@@ -161,13 +161,26 @@ jobs:
         shell: bash
         run: |
           nix run .#ci-initial-samples -- --creator-binding "${{ steps.checkout_git.outputs.binding }}"
-      - run: nix develop --command just test 2>&1 | tee test.log
+      - id: original_tests
+        run: nix develop --command just test 2>&1 | tee test.log
+        shell: bash
+      - name: Observe native Darwin admission after original test failure
+        if: ${{ failure() && runner.os == 'macOS' && steps.original_tests.outcome == 'failure' }}
+        run: nix develop --command nim c -r -d:acpAdmissionDiagnostics --path:src tests/test_send_with_stream.nim 2>&1 | tee admission-diagnostic.log
         shell: bash
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-log-${{ join(matrix.runner, '-') }}
           path: nim-acp/test.log
+      - name: Retain native admission diagnostic log
+        if: ${{ always() && runner.os == 'macOS' && steps.original_tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-diagnostic-${{ join(matrix.runner, '-') }}
+          path: nim-acp/admission-diagnostic.log
+          if-no-files-found: warn
+
   lint:
     defaults:
       run:

@@ -25,6 +25,87 @@
 extern char **environ;
 #endif
 
+
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+/* Control-only, caller-thread snapshot. No logging, signaling, or reaping.
+ * Failure-only read occurs after the original admission outcome is fixed. */
+struct acp_admission_diagnostic {
+  int reader_fd, reader_fd_errno, reader_fl, reader_fl_errno;
+  int writer_fd, writer_fd_errno, writer_fl, writer_fl_errno;
+  int failure_probe_attempted, flags_result, flags_errno;
+  int sigchld_query, sigchld_errno, sigchld_kind, sigchld_flags;
+  int startup_error, received, poll_result, poll_errno, poll_revents;
+  int nonblock_set, nonblock_errno, read_result, read_errno, read_child_errno;
+  int restore_result, restore_errno, wait_result, wait_errno, wait_code, wait_status;
+  long child_pid, wait_pid, session_result, group_result;
+  int session_errno, group_errno;
+};
+static _Thread_local struct acp_admission_diagnostic admission_diagnostic;
+const struct acp_admission_diagnostic *acp_admission_snapshot(void) {
+  return &admission_diagnostic;
+}
+const char *acp_admission_snapshot_json(void) {
+  static _Thread_local char text[4096];
+  const struct acp_admission_diagnostic *d=&admission_diagnostic;
+  int saved=errno;
+  snprintf(text,sizeof text,
+    "{\"schema\":1,\"attempted\":%d,\"readerFD\":%d,\"readerFDErrno\":%d,\"readerFL\":%d,\"readerFLErrno\":%d,"
+    "\"writerFD\":%d,\"writerFDErrno\":%d,\"writerFL\":%d,\"writerFLErrno\":%d,"
+    "\"sigchldQuery\":%d,\"sigchldErrno\":%d,\"sigchldKind\":%d,\"sigchldFlags\":%d,"
+    "\"startupError\":%d,\"received\":%d,\"pollResult\":%d,\"pollErrno\":%d,\"revents\":%d,"
+    "\"flagsResult\":%d,\"flagsErrno\":%d,\"nonblockSet\":%d,\"nonblockErrno\":%d,"
+    "\"readResult\":%d,\"readErrno\":%d,\"readChildErrno\":%d,\"restoreResult\":%d,\"restoreErrno\":%d,"
+    "\"waitResult\":%d,\"waitErrno\":%d,\"waitCode\":%d,\"waitStatus\":%d,\"childPID\":%ld,\"waitPID\":%ld,"
+    "\"sessionResult\":%ld,\"groupResult\":%ld,\"sessionErrno\":%d,\"groupErrno\":%d}",
+    d->failure_probe_attempted,d->reader_fd,d->reader_fd_errno,d->reader_fl,d->reader_fl_errno,
+    d->writer_fd,d->writer_fd_errno,d->writer_fl,d->writer_fl_errno,
+    d->sigchld_query,d->sigchld_errno,d->sigchld_kind,d->sigchld_flags,
+    d->startup_error,d->received,d->poll_result,d->poll_errno,d->poll_revents,
+    d->flags_result,d->flags_errno,d->nonblock_set,d->nonblock_errno,
+    d->read_result,d->read_errno,d->read_child_errno,d->restore_result,d->restore_errno,
+    d->wait_result,d->wait_errno,d->wait_code,d->wait_status,d->child_pid,d->wait_pid,
+    d->session_result,d->group_result,d->session_errno,d->group_errno);
+  errno=saved;return text;
+}
+static void admission_before_fork(int fds[2]) {
+  struct acp_admission_diagnostic *d=&admission_diagnostic;
+  struct sigaction action;
+  memset(d,0,sizeof *d);
+  d->poll_result=d->nonblock_set=d->read_result=d->restore_result=-2;
+  d->wait_result=-2;d->session_result=d->group_result=-2;
+  errno=0;d->reader_fd=fcntl(fds[0],F_GETFD);d->reader_fd_errno=errno;
+  errno=0;d->reader_fl=fcntl(fds[0],F_GETFL);d->reader_fl_errno=errno;
+  errno=0;d->writer_fd=fcntl(fds[1],F_GETFD);d->writer_fd_errno=errno;
+  errno=0;d->writer_fl=fcntl(fds[1],F_GETFL);d->writer_fl_errno=errno;
+  errno=0;d->sigchld_query=sigaction(SIGCHLD,NULL,&action);d->sigchld_errno=errno;
+  if(!d->sigchld_query){
+    d->sigchld_kind=action.sa_handler==SIG_DFL?0:action.sa_handler==SIG_IGN?1:2;
+    d->sigchld_flags=action.sa_flags;
+  }
+}
+static void admission_failed_snapshot(int fd,pid_t pid,int error,size_t received) {
+  struct acp_admission_diagnostic *d=&admission_diagnostic;
+  int saved=errno;struct pollfd ready={fd,POLLIN,0};siginfo_t info;
+  d->failure_probe_attempted=1;
+  d->startup_error=error;d->received=(int)received;d->child_pid=(long)pid;
+  errno=0;d->poll_result=poll(&ready,1,0);d->poll_errno=errno;d->poll_revents=ready.revents;
+  errno=0;int flags=fcntl(fd,F_GETFL);d->flags_result=flags;d->flags_errno=errno;
+  if(flags>=0){errno=0;d->nonblock_set=fcntl(fd,F_SETFL,flags|O_NONBLOCK);d->nonblock_errno=errno;}
+  d->read_result=-2;
+  if(!d->nonblock_set){
+    int value=0;errno=0;d->read_result=(int)read(fd,&value,sizeof value);d->read_errno=errno;
+    if(d->read_result==(int)sizeof value)d->read_child_errno=value;
+    errno=0;d->restore_result=fcntl(fd,F_SETFL,flags);d->restore_errno=errno;
+  }
+  memset(&info,0,sizeof info);errno=0;
+  d->wait_result=waitid(P_PID,(id_t)pid,&info,WEXITED|WNOHANG|WNOWAIT);d->wait_errno=errno;
+  d->wait_pid=(long)info.si_pid;d->wait_code=info.si_code;d->wait_status=info.si_status;
+  errno=0;d->session_result=(long)getsid(pid);d->session_errno=errno;
+  errno=0;d->group_result=(long)getpgid(pid);d->group_errno=errno;
+  errno=saved;
+}
+#endif
+
 /* The leader is never reaped by polling. Its retained child identity pins the
  * session/group number until the final group signal has completed. A caller
  * must not independently reap this private child through a global SIGCHLD
@@ -147,6 +228,9 @@ int acp_owned_spawn(const char *image, char *const argv[], char *const env[],
    * actual caller sink atomically; never create an unread private stderr pipe. */
   error[1]=fcntl(STDERR_FILENO,F_DUPFD_CLOEXEC,3);
   if(error[1]<0){e=errno;goto failed;}
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_before_fork(admission);
+#endif
   c->pid = fork();
   if (c->pid < 0) { e=errno; goto failed; }
   if (c->pid == 0) {
@@ -185,6 +269,13 @@ child_failed:
       if (n == 0) break;
       received+=(size_t)n;
     }
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+    admission_diagnostic.startup_error=e;
+    admission_diagnostic.received=(int)received;
+    admission_diagnostic.child_pid=(long)c->pid;
+    if(received==sizeof e)admission_diagnostic.read_child_errno=e;
+    if(read_error)admission_failed_snapshot(admission[0],c->pid,e,received);
+#endif
     drop(&admission[0]);
     if (read_error) {
       /* EOF was not observed, so application execution is uncertain. Retain

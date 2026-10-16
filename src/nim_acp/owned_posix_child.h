@@ -10,4 +10,7 @@ int acp_owned_alive(acp_owned_posix_child *);
 int acp_owned_drained(acp_owned_posix_child *);
 int acp_owned_close(acp_owned_posix_child *,int,int);
 void acp_owned_free(acp_owned_posix_child *);
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+const char *acp_admission_snapshot_json(void);
+#endif
 #endif
