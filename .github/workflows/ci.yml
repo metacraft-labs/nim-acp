@@ -34,11 +34,12 @@ jobs:
           path: nim-acp
       - name: Bind checkout-time Git constructor
         id: checkout_git
-        shell: bash
-        run: |
-          binding_dir="$(mktemp -d "$RUNNER_TEMP/nim-acp-checkout-git.XXXXXX")"
-          python3 ci/capture_original_git.py --bind-creator "$binding_dir/creator.json"
-          printf 'binding=%s\n' "$binding_dir/creator.json" >> "$GITHUB_OUTPUT"
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7, supplied Node 20 runtime
+        with:
+          script: |
+            const root = require("path").join(process.env.GITHUB_WORKSPACE, "nim-acp");
+            const bind = require(require("path").join(root, "ci", "bind-checkout-creator.cjs"));
+            await bind({ core, io, root });
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
@@ -80,11 +81,12 @@ jobs:
           path: nim-acp
       - name: Bind checkout-time Git constructor
         id: checkout_git
-        shell: bash
-        run: |
-          binding_dir="$(mktemp -d "$RUNNER_TEMP/nim-acp-checkout-git.XXXXXX")"
-          python3 ci/capture_original_git.py --bind-creator "$binding_dir/creator.json"
-          printf 'binding=%s\n' "$binding_dir/creator.json" >> "$GITHUB_OUTPUT"
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7, supplied Node 20 runtime
+        with:
+          script: |
+            const root = require("path").join(process.env.GITHUB_WORKSPACE, "nim-acp");
+            const bind = require(require("path").join(root, "ci", "bind-checkout-creator.cjs"));
+            await bind({ core, io, root });
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature

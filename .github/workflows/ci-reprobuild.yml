@@ -59,11 +59,12 @@ jobs:
       - name: Bind checkout-time Git constructor
         id: checkout_git
         if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          binding_dir="$(mktemp -d "$RUNNER_TEMP/nim-acp-checkout-git.XXXXXX")"
-          python3 ci/capture_original_git.py --bind-creator "$binding_dir/creator.json"
-          printf 'binding=%s\n' "$binding_dir/creator.json" >> "$GITHUB_OUTPUT"
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7, supplied Node 20 runtime
+        with:
+          script: |
+            const root = process.env.GITHUB_WORKSPACE;
+            const bind = require(require("path").join(root, "ci", "bind-checkout-creator.cjs"));
+            await bind({ core, io, root });
 
       # Mint a GitHub App installation token via the CI Token Provider
       # app so the reprobuild flake/sibling steps can clone private

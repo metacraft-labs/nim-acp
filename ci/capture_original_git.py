@@ -41,6 +41,36 @@ def inventory(directory):
     require(result, 'Empty initial sample inventory')
     return result
 
+def read_creator_binding(path):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, 'Duplicate creator binding field')
+            result[key] = value
+        return result
+    value = json.loads(P(path).read_text(), object_pairs_hook=unique_object)
+    require(type(value) is dict and set(value) == {
+        'schema', 'statEncoding', 'root', 'creator', 'principal',
+        'inheritedExecPath', 'version', 'execPath'}, 'Creator binding fields differ')
+    require(value['schema'] == 'nim-acp-checkout-creator.v1' and
+            value['statEncoding'] == 'decimal-v1', 'Creator binding schema differs')
+    for field in ('root', 'creator', 'version', 'execPath'):
+        require(type(value[field]) is str and value[field], 'Creator binding text malformed: ' + field)
+    require(value['inheritedExecPath'] is None or type(value['inheritedExecPath']) is str,
+            'Creator binding exec selector malformed')
+    row = value['principal']
+    require(type(row) is dict and set(row) == {'sha', 'mode', 'dev', 'ino'},
+            'Creator principal fields differ')
+    require(type(row['sha']) is str and re.fullmatch(r'[0-9a-f]{64}', row['sha']) is not None,
+            'Creator digest malformed')
+    require(type(row['mode']) is int and 0 <= row['mode'] <= 0o7777,
+            'Creator mode malformed')
+    for field in ('dev', 'ino'):
+        require(type(row[field]) is str and re.fullmatch(r'0|[1-9][0-9]*', row[field]) is not None,
+                'Creator decimal principal malformed: ' + field)
+        row[field] = int(row[field])
+    return value
+
 def capture(root, receipt, creator_binding=None):
     require(root == P.cwd() and root.is_absolute(), 'Wrong owning cwd')
     for path in (root, *root.parents, root/'.git', root/'.git/hooks'):
@@ -49,7 +79,7 @@ def capture(root, receipt, creator_binding=None):
     forbidden = ('GIT_CONFIG','GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_TEMPLATE_DIR','GIT_CONFIG_PARAMETERS','GIT_CONFIG_COUNT','GIT_INDEX_FILE','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES')
     require(not any(os.environ.get(name) for name in forbidden), 'Inherited Git selector refused')
     require(not any(name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')) for name in os.environ), 'Counted config refused')
-    binding = json.loads(P(creator_binding).read_text()) if creator_binding else None
+    binding = read_creator_binding(creator_binding) if creator_binding else None
     image = P(binding['creator']).resolve(strict=True) if binding else P(shutil.which('git')).resolve(strict=True)
     principal = regular(image)
     if binding:
@@ -66,6 +96,8 @@ def capture(root, receipt, creator_binding=None):
         result = git(*args)
         require(result.returncode == 0, 'Git command failed: '+args[0])
         return result.stdout
+    if binding:
+        require(checked('--version').decode().strip()==binding['version'], 'Checkout-time creator version changed')
     def head():
         oid = checked('rev-parse','HEAD').decode().strip()
         require(re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', oid) is not None, 'Invalid full HEAD identity')
@@ -132,7 +164,8 @@ def bind_creator(root, destination):
         results[key]=result.stdout.decode().strip()
     require(regular(image)==principal, 'Creator image changed during binding')
     with destination.open('x') as output:
-        json.dump(dict(root=str(root),creator=str(image),principal=principal,
+        json.dump(dict(schema='nim-acp-checkout-creator.v1',statEncoding='decimal-v1',
+            root=str(root),creator=str(image),principal=dict(principal,dev=str(principal['dev']),ino=str(principal['ino'])),
             inheritedExecPath=os.environ.get('GIT_EXEC_PATH'),**results),output,indent=2)
         output.write('\n')
 

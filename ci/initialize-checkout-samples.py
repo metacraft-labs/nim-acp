@@ -7,14 +7,14 @@ import stat
 import sys
 import tempfile
 
-from capture_original_git import capture, require, directory
+from capture_original_git import capture, require, directory, read_creator_binding
 from transition_initial_samples import transition
 
 root = Path.cwd()
 selected = Path(sys.argv[1]).resolve(strict=True)
 creator_binding = Path(sys.argv[3]).resolve(strict=True) if sys.argv[2]=='--creator-binding' else None
 if creator_binding:
-    original = Path(json.loads(creator_binding.read_text())['creator']).resolve(strict=True)
+    original = Path(read_creator_binding(creator_binding)['creator']).resolve(strict=True)
 else:
     original = Path(sys.argv[2]).resolve(strict=True)
     require(Path(shutil.which('git')).resolve(strict=True) == original,
