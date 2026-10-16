@@ -3,7 +3,7 @@ schema = "reprobuild.solved-graph-lock.v2"
 [lock]
 platform = "amd64-linux"
 optimal = false
-inputs_digest = "fnv1a64:f67e198da7bd7ffa"
+inputs_digest = "fnv1a64:92042a972a671730"
 variants = []
-packages = [{ name = "gcc", version = "12.0.0", source = "gcc", selection = "selected" }, { name = "nim", version = "2.0.0", source = "nim", selection = "selected" }, { name = "nim_acp", version = "0.1.0", source = "nim_acp", selection = "selected" }]
-deps = [{ name = "nim-acp", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/nim-acp", ref = "", revision = "1e518817267e5a31e054f8799f5314c1b23580e0", integrity = "git-sha1:1e518817267e5a31e054f8799f5314c1b23580e0", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
+packages = [{ name = "gcc", version = "12.0.0", source = "gcc", selection = "selected" }, { name = "just", version = "1.0.0", source = "just", selection = "selected" }, { name = "nim", version = "2.0.0", source = "nim", selection = "selected" }, { name = "nim_acp", version = "0.1.0", source = "nim_acp", selection = "selected" }, { name = "node", version = "20.0.0", source = "node", selection = "selected" }]
+deps = [{ name = "nim-acp", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/nim-acp", ref = "", revision = "ccd5b4e86168540867921f30852023c772b1c6cc", integrity = "git-sha1:ccd5b4e86168540867921f30852023c772b1c6cc", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
