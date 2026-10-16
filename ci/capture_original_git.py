@@ -1,5 +1,5 @@
 """Read-only initial-checkout factory proof; no hook admission or mutation."""
-import hashlib, json, os, pathlib, shutil, stat, subprocess, tempfile, re
+import hashlib, json, os, pathlib, shutil, stat, subprocess, tempfile, re, sys
 P = pathlib.Path
 
 def require(ok, reason):
@@ -41,7 +41,7 @@ def inventory(directory):
     require(result, 'Empty initial sample inventory')
     return result
 
-def capture(root, receipt):
+def capture(root, receipt, creator_binding=None):
     require(root == P.cwd() and root.is_absolute(), 'Wrong owning cwd')
     for path in (root, *root.parents, root/'.git', root/'.git/hooks'):
         require(not path.is_symlink(), 'Symlink authority refused')
@@ -49,12 +49,19 @@ def capture(root, receipt):
     forbidden = ('GIT_CONFIG','GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_TEMPLATE_DIR','GIT_CONFIG_PARAMETERS','GIT_CONFIG_COUNT','GIT_INDEX_FILE','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES')
     require(not any(os.environ.get(name) for name in forbidden), 'Inherited Git selector refused')
     require(not any(name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')) for name in os.environ), 'Counted config refused')
-    image = P(shutil.which('git')).resolve(strict=True)
+    binding = json.loads(P(creator_binding).read_text()) if creator_binding else None
+    image = P(binding['creator']).resolve(strict=True) if binding else P(shutil.which('git')).resolve(strict=True)
     principal = regular(image)
+    if binding:
+        require(binding['root']==str(root), 'Creator binding root differs')
+        require(principal==binding['principal'], 'Checkout-time creator image changed')
+        require(os.environ.get('GIT_EXEC_PATH')==binding['inheritedExecPath'], 'Checkout-time Git exec selector changed')
     env = dict(os.environ, GIT_OPTIONAL_LOCKS='0', GIT_NO_LAZY_FETCH='1')
     def git(*args): return subprocess.run([str(image), *args], cwd=root, env=env, capture_output=True, check=False)
     for key in ('init.templateDir', 'core.hooksPath', 'core.sharedRepository'):
         require(git('config','--get-all',key).returncode == 1, 'Configured constructor policy refused: '+key)
+    if binding:
+        require(git('--exec-path').returncode==0 and git('--exec-path').stdout.decode().strip()==binding['execPath'], 'Checkout-time exec path changed')
     def checked(*args):
         result = git(*args)
         require(result.returncode == 0, 'Git command failed: '+args[0])
@@ -91,7 +98,20 @@ def capture(root, receipt):
     with tempfile.TemporaryDirectory(prefix='acp-original-git-factory-') as temporary:
         probe = P(temporary)/'probe'
         subprocess.run([str(image),'init',str(probe)],env=probe_env,check=True,capture_output=True)
-        require(inventory(probe/'.git/hooks') == before['hooks'], 'Actual creator factory differs from checkout samples')
+        factory = inventory(probe/'.git/hooks')
+        if factory != before['hooks']:
+            # Diagnostic failure must never replace the original refusal.
+            try:
+                print(json.dumps(dict(event='acp-original-factory-mismatch',
+                    creator=str(image), principal=principal,
+                    version=checked('--version').decode().strip(),
+                    execPath=checked('--exec-path').decode().strip(),
+                    inheritedExecPath=os.environ.get('GIT_EXEC_PATH'),
+                    checkout=before['hooks'], factory=factory), sort_keys=True),
+                    file=sys.stderr, flush=True)
+            except Exception:
+                pass
+            require(False, 'Actual creator factory differs from checkout samples')
     require(regular(image) == principal, 'Creator image changed')
     require(regular(root/'.git/index') == before['index'] and regular(root/'.git/config') == before['config'] and inventory(root/'.git/hooks') == before['hooks'], 'Checkout changed during capture')
     require(head() == before['head'], 'HEAD changed')
@@ -102,6 +122,22 @@ def capture(root, receipt):
         json.dump(dict(root=str(root), creator=str(image), principal=principal, before=before, native=False, transition=False), output, indent=2)
         output.write('\n')
 
+def bind_creator(root, destination):
+    require(root==P.cwd() and root.is_absolute(), 'Wrong creator-binding cwd')
+    image=P(shutil.which('git')).resolve(strict=True)
+    principal=regular(image)
+    results={}
+    for key,argv in (('version',['--version']),('execPath',['--exec-path'])):
+        result=subprocess.run([str(image),*argv],cwd=root,capture_output=True,check=True)
+        results[key]=result.stdout.decode().strip()
+    require(regular(image)==principal, 'Creator image changed during binding')
+    with destination.open('x') as output:
+        json.dump(dict(root=str(root),creator=str(image),principal=principal,
+            inheritedExecPath=os.environ.get('GIT_EXEC_PATH'),**results),output,indent=2)
+        output.write('\n')
+
 if __name__ == '__main__':
-    import sys
-    capture(P.cwd(), P(sys.argv[1]))
+    if sys.argv[1]=='--bind-creator':
+        bind_creator(P.cwd(),P(sys.argv[2]))
+    else:
+        capture(P.cwd(),P(sys.argv[1]),P(sys.argv[2]) if len(sys.argv)>2 else None)

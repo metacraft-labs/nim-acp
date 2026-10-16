@@ -32,6 +32,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: nim-acp
+      - name: Bind checkout-time Git constructor
+        id: checkout_git
+        shell: bash
+        run: |
+          binding_dir="$(mktemp -d "$RUNNER_TEMP/nim-acp-checkout-git.XXXXXX")"
+          python3 ci/capture_original_git.py --bind-creator "$binding_dir/creator.json"
+          printf 'binding=%s\n' "$binding_dir/creator.json" >> "$GITHUB_OUTPUT"
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
@@ -45,8 +52,7 @@ jobs:
       - name: Authenticate and transition initial checkout Git samples
         shell: bash
         run: |
-          original_git="$(command -v git)"
-          nix run .#ci-initial-samples -- "$original_git"
+          nix run .#ci-initial-samples -- --creator-binding "${{ steps.checkout_git.outputs.binding }}"
       - run: nix develop --command just test 2>&1 | tee test.log
         shell: bash
       - uses: actions/upload-artifact@v4
@@ -72,6 +78,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: nim-acp
+      - name: Bind checkout-time Git constructor
+        id: checkout_git
+        shell: bash
+        run: |
+          binding_dir="$(mktemp -d "$RUNNER_TEMP/nim-acp-checkout-git.XXXXXX")"
+          python3 ci/capture_original_git.py --bind-creator "$binding_dir/creator.json"
+          printf 'binding=%s\n' "$binding_dir/creator.json" >> "$GITHUB_OUTPUT"
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
@@ -82,8 +95,7 @@ jobs:
       - name: Authenticate and transition initial checkout Git samples
         shell: bash
         run: |
-          original_git="$(command -v git)"
-          nix run .#ci-initial-samples -- "$original_git"
+          nix run .#ci-initial-samples -- --creator-binding "${{ steps.checkout_git.outputs.binding }}"
       - run: nix develop --command just lint 2>&1 | tee lint.log
         shell: bash
       - uses: actions/upload-artifact@v4

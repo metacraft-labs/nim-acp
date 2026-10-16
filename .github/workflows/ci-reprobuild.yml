@@ -56,6 +56,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Bind checkout-time Git constructor
+        id: checkout_git
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          binding_dir="$(mktemp -d "$RUNNER_TEMP/nim-acp-checkout-git.XXXXXX")"
+          python3 ci/capture_original_git.py --bind-creator "$binding_dir/creator.json"
+          printf 'binding=%s\n' "$binding_dir/creator.json" >> "$GITHUB_OUTPUT"
+
       # Mint a GitHub App installation token via the CI Token Provider
       # app so the reprobuild flake/sibling steps can clone private
       # metacraft-labs repos (codetracer-native-recorder, runquota,
@@ -80,8 +89,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          original_git="$(command -v git)"
-          nix run .#ci-initial-samples -- "$original_git"
+          nix run .#ci-initial-samples -- --creator-binding "${{ steps.checkout_git.outputs.binding }}"
 
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
@@ -175,6 +183,7 @@ jobs:
           path: |
             .repro/build/*/build-failure-report.json
             .repro/build/*/build-engine-cache/actions/
+            .repro/build/repro/path-only-tool-identities.inspect.json
           include-hidden-files: true
           retention-days: 7
           if-no-files-found: warn

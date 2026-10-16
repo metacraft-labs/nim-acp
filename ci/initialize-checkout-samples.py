@@ -12,9 +12,13 @@ from transition_initial_samples import transition
 
 root = Path.cwd()
 selected = Path(sys.argv[1]).resolve(strict=True)
-original = Path(sys.argv[2]).resolve(strict=True)
-require(Path(shutil.which('git')).resolve(strict=True) == original,
-        'Original checkout Git selection changed before capture')
+creator_binding = Path(sys.argv[3]).resolve(strict=True) if sys.argv[2]=='--creator-binding' else None
+if creator_binding:
+    original = Path(json.loads(creator_binding.read_text())['creator']).resolve(strict=True)
+else:
+    original = Path(sys.argv[2]).resolve(strict=True)
+    require(Path(shutil.which('git')).resolve(strict=True) == original,
+            'Original checkout Git selection changed before capture')
 # This transition owns only untouched initial sample inventories. Existing
 # managed/native/unknown hooks receive no admission here: the unchanged owning
 # shell guard must authenticate or refuse them before any original CI gate.
@@ -27,6 +31,6 @@ proof_directory = Path(tempfile.mkdtemp(prefix='nim-acp-checkout-factory-'))
 require(stat.S_IMODE(proof_directory.lstat().st_mode) == 0o700,
         'Private capture directory mode differs')
 receipt = proof_directory / 'initial-checkout.json'
-capture(root, receipt)
+capture(root, receipt, creator_binding)
 result = transition(receipt, selected)
 print(json.dumps({'capture': str(receipt), 'transition': result}))
