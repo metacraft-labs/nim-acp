@@ -166,7 +166,7 @@ jobs:
         shell: bash
       - name: Observe native Darwin admission after original test failure
         if: ${{ failure() && runner.os == 'macOS' && steps.original_tests.outcome == 'failure' }}
-        run: nix develop --command nim c -r -d:acpAdmissionDiagnostics --path:src tests/test_send_with_stream.nim 2>&1 | tee admission-diagnostic.log
+        run: nix develop --command nim c -r -d:acpAdmissionDiagnostics --nimcache:.nimcache/tests/acp-admission-diagnostic --out:build/test_send_with_stream_admission_diagnostic --path:src tests/test_send_with_stream.nim 2>&1 | tee admission-diagnostic.log
         shell: bash
       - uses: actions/upload-artifact@v4
         if: always()
