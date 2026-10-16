@@ -348,6 +348,18 @@ jobs:
       - name: just test (cross-check)
         run: dev-exec just test
 
+      - name: Observe native Darwin cleanup after original failure
+        if: ${{ failure() && runner.os == 'macOS' }}
+        shell: bash
+        run: dev-exec nim c -r -d:acpAdmissionDiagnostics --nimcache:.nimcache/tests/acp-repro-admission-diagnostic --out:build/test_send_with_stream_repro_admission_diagnostic --path:src tests/test_send_with_stream.nim 2>&1 | tee repro-admission-diagnostic.log
+
+      - name: Observe declared Windows x64 fixture tools after original failure
+        if: ${{ failure() && runner.os == 'Windows' && matrix.arch == 'x64' }}
+        shell: pwsh
+        run: |
+          & ./ci/observe-cached-native-x64-git-tools.ps1 | Tee-Object -FilePath windows-fixture-tools-diagnostic.json
+          exit $LASTEXITCODE
+
       # Diagnostics on failure. Three things below are load-bearing:
       #
       # 1. `include-hidden-files: true`. actions/upload-artifact@v4 defaults this
@@ -386,6 +398,8 @@ jobs:
             .repro/build/*/build-failure-report.json
             .repro/build/*/build-engine-cache/actions/
             .repro/build/repro/path-only-tool-identities.inspect.json
+            repro-admission-diagnostic.log
+            windows-fixture-tools-diagnostic.json
           include-hidden-files: true
           retention-days: 7
           if-no-files-found: warn
