@@ -19,12 +19,18 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #if defined(__APPLE__)
 #include <crt_externs.h>
 #else
 extern char **environ;
 #endif
 
+
+#define ACP_ADMISSION_MAGIC UINT32_C(0x41435032)
+enum { ACP_SESSION_ESTABLISHED = 1, ACP_EXEC_FAILED = 2 };
+struct acp_admission_frame { uint32_t magic, kind; int32_t value; };
+_Static_assert(sizeof(struct acp_admission_frame) == 12, "private admission frame size");
 
 #ifdef ACP_ADMISSION_DIAGNOSTICS
 /* Control-only, caller-thread snapshot. No logging, signaling, or reaping.
@@ -44,6 +50,7 @@ struct acp_admission_diagnostic {
   long leader_wait_pid, close_child_pid, close_session_result, close_group_result;
   int close_session_attempted, close_session_errno;
   int close_group_attempted, close_group_errno;
+  int session_acknowledged;
 };
 static _Thread_local struct acp_admission_diagnostic admission_diagnostic;
 const struct acp_admission_diagnostic *acp_admission_snapshot(void) {
@@ -65,7 +72,7 @@ const char *acp_admission_snapshot_json(void) {
     "\"closeChildPID\":%ld,\"closeAttempted\":%d,\"closeStage\":%d,\"closeError\":%d,\"closeSignal\":%d,"
     "\"leaderAttempted\":%d,\"leaderWaitResult\":%d,\"leaderWaitErrno\":%d,\"leaderWaitCode\":%d,\"leaderWaitPID\":%ld,"
     "\"closeSessionAttempted\":%d,\"closeSessionResult\":%ld,\"closeSessionErrno\":%d,"
-    "\"closeGroupAttempted\":%d,\"closeGroupResult\":%ld,\"closeGroupErrno\":%d}",
+    "\"closeGroupAttempted\":%d,\"closeGroupResult\":%ld,\"closeGroupErrno\":%d,\"sessionAcknowledged\":%d}",
     d->failure_probe_attempted,d->reader_fd,d->reader_fd_errno,d->reader_fl,d->reader_fl_errno,
     d->writer_fd,d->writer_fd_errno,d->writer_fl,d->writer_fl_errno,
     d->sigchld_query,d->sigchld_errno,d->sigchld_kind,d->sigchld_flags,
@@ -77,7 +84,7 @@ const char *acp_admission_snapshot_json(void) {
     d->close_child_pid,d->close_attempted,d->close_stage,d->close_error,d->close_signal,
     d->leader_attempted,d->leader_wait_result,d->leader_wait_errno,d->leader_wait_code,d->leader_wait_pid,
     d->close_session_attempted,d->close_session_result,d->close_session_errno,
-    d->close_group_attempted,d->close_group_result,d->close_group_errno);
+    d->close_group_attempted,d->close_group_result,d->close_group_errno,d->session_acknowledged);
   errno=saved;return text;
 }
 static void admission_before_fork(int fds[2]) {
@@ -106,8 +113,10 @@ static void admission_failed_snapshot(int fd,pid_t pid,int error,size_t received
   if(flags>=0){errno=0;d->nonblock_set=fcntl(fd,F_SETFL,flags|O_NONBLOCK);d->nonblock_errno=errno;}
   d->read_result=-2;
   if(!d->nonblock_set){
-    int value=0;errno=0;d->read_result=(int)read(fd,&value,sizeof value);d->read_errno=errno;
-    if(d->read_result==(int)sizeof value)d->read_child_errno=value;
+    struct acp_admission_frame value={0};errno=0;d->read_result=(int)read(fd,&value,sizeof value);d->read_errno=errno;
+    if(received==0 && d->read_result==(int)sizeof value &&
+        value.magic==ACP_ADMISSION_MAGIC && value.kind==ACP_EXEC_FAILED &&
+        value.value>0)d->read_child_errno=value.value;
     errno=0;d->restore_result=fcntl(fd,F_SETFL,flags);d->restore_errno=errno;
   }
   memset(&info,0,sizeof info);errno=0;
@@ -123,7 +132,34 @@ static void admission_failed_snapshot(int fd,pid_t pid,int error,size_t received
  * session/group number until the final group signal has completed. A caller
  * must not independently reap this private child through a global SIGCHLD
  * handler. Such loss of ownership is a failure, never permission to signal. */
-struct acp_owned_posix_child { pid_t pid; int input, output, error, reaped, drained, failed_exec; int closing, io_users; pthread_mutex_t state, writer, closer; };
+struct acp_owned_posix_child { pid_t pid; int input, output, error, reaped, drained, failed_exec; int closing, io_users, session_established; pthread_mutex_t state, writer, closer; };
+
+/* Private pre-exec channel. A successful EOF alone never establishes a session:
+ * a child killed before setsid also closes its CLOEXEC writer. */
+static int admission_write_frame(int fd, uint32_t kind, int32_t value) {
+  const struct acp_admission_frame frame={ACP_ADMISSION_MAGIC,kind,value};
+  const unsigned char *bytes=(const unsigned char *)&frame;
+  size_t sent=0;
+  while(sent<sizeof frame) {
+    ssize_t n=write(fd,bytes+sent,sizeof frame-sent);
+    if(n>0){sent+=(size_t)n;continue;}
+    if(n<0&&errno==EINTR)continue;
+    return -1;
+  }
+  return 0;
+}
+static int admission_accept_frame(acp_owned_posix_child *c,
+    const struct acp_admission_frame *frame, int *child_errno) {
+  if(*child_errno || frame->magic!=ACP_ADMISSION_MAGIC)return EIO;
+  if(frame->kind==ACP_SESSION_ESTABLISHED) {
+    if(c->session_established||frame->value<=0||frame->value!=c->pid)return EIO;
+    c->session_established=1;return 0;
+  }
+  if(frame->kind==ACP_EXEC_FAILED&&frame->value>0) {
+    *child_errno=frame->value;return 0;
+  }
+  return EIO;
+}
 
 static void drop(int *fd) { if (*fd >= 0) { close(*fd); *fd = -1; } }
 /* Before fork: every descriptor is close-on-exec from its first publication.
@@ -208,7 +244,10 @@ static int leader_alive(acp_owned_posix_child *c) {
     if(result>=0)break;
     if (errno != EINTR) return -errno;
   } while(result<0);
-  return info.si_pid == 0;
+  if(info.si_pid==0)return 1;
+  if(info.si_pid!=c->pid || (info.si_code!=CLD_EXITED &&
+      info.si_code!=CLD_KILLED && info.si_code!=CLD_DUMPED))return -ECHILD;
+  return 0;
 }
 #else
 static int leader_alive(acp_owned_posix_child *c) {
@@ -218,7 +257,10 @@ static int leader_alive(acp_owned_posix_child *c) {
   while (waitid(P_PID, (id_t)c->pid, &info, WEXITED | WNOHANG | WNOWAIT) < 0) {
     if (errno != EINTR) return -errno;
   }
-  return info.si_pid == 0;
+  if(info.si_pid==0)return 1;
+  if(info.si_pid!=c->pid || (info.si_code!=CLD_EXITED &&
+      info.si_code!=CLD_KILLED && info.si_code!=CLD_DUMPED))return -ECHILD;
+  return 0;
 }
 #endif
 static int wait_alive_until(acp_owned_posix_child *c, long long end) {
@@ -269,23 +311,29 @@ int acp_owned_spawn(const char *image, char *const argv[], char *const env[],
   if (c->pid == 0) {
     /* No Nim, allocation, PATH lookup, or shared-runtime lock after fork. */
     close(admission[0]);
-    if (setsid() < 0 || dup2(in[0], STDIN_FILENO) < 0 ||
+    pid_t session=setsid();
+    if(session<0)goto child_failed;
+    if(session!=getpid()){errno=EPROTO;goto child_failed;}
+    if (dup2(in[0], STDIN_FILENO) < 0 ||
         dup2(output[1], STDOUT_FILENO) < 0 ||
         dup2(error[1], STDERR_FILENO) < 0) goto child_failed;
     close(in[0]); close(in[1]); close(output[0]); close(output[1]);
     close(error[0]); close(error[1]);
+    if(admission_write_frame(admission[1],ACP_SESSION_ESTABLISHED,(int32_t)session)<0)
+      _exit(127);
     execve(image, argv, env);
 child_failed:
     e=errno;
-    /* The bounded errno write is below PIPE_BUF; EINTR is retried. */
-    while (write(admission[1], &e, sizeof e) < 0 && errno == EINTR) {}
+    /* A complete error frame proves no application exec was entered. */
+    (void)admission_write_frame(admission[1],ACP_EXEC_FAILED,(int32_t)e);
     _exit(127);
   }
   drop(&in[0]); drop(&output[1]); drop(&error[1]); drop(&admission[1]);
   {
-    unsigned char *dst=(unsigned char *)&e;
+    struct acp_admission_frame frame;
+    unsigned char *dst=(unsigned char *)&frame;
     size_t received=0;
-    int read_error=0;
+    int read_error=0, child_errno=0;
     long long admission_start=millis();
     if(admission_start < 0) { e=errno;read_error=1; }
     if(!read_error) {
@@ -295,7 +343,7 @@ child_failed:
         e=errno;read_error=1;
       }
     }
-    while (!read_error && received < sizeof e) {
+    while (!read_error) {
       long long now=millis();
       if(now < 0) { e=errno;read_error=1;break; }
       long long remaining=admission_start+2000-now;
@@ -303,9 +351,28 @@ child_failed:
       /* Darwin FIFO poll can miss EOF after the CLOEXEC writer closes.
        * The nonblocking read is authoritative; poll only bounds the next
        * retry. A short poll timeout never replaces the absolute deadline. */
-      ssize_t n=read(admission[0], dst+received, sizeof e-received);
-      if (n == 0) break;
-      if (n > 0) { received+=(size_t)n;continue; }
+      ssize_t n=read(admission[0], dst+received, sizeof frame-received);
+      if (n == 0) {
+        if(received){e=EIO;read_error=1;}
+        else if(!c->session_established && !child_errno) {
+          /* The trusted pre-exec child cannot enter application code until
+           * its complete session frame has been written. Clean empty EOF
+           * therefore proves no exec, not a private session. Reap only this
+           * original direct child; never grant group authority from EOF. */
+          c->failed_exec=1;e=EIO;read_error=1;
+        } else e=child_errno;
+        break;
+      }
+      if (n > 0) {
+        received+=(size_t)n;
+        if(received==sizeof frame) {
+          e=admission_accept_frame(c,&frame,&child_errno);
+          if(e){read_error=1;break;}
+          received=0;
+          if(child_errno)e=child_errno;
+        }
+        continue;
+      }
       if (errno==EINTR) continue;
       if (errno!=EAGAIN && errno!=EWOULDBLOCK) {
         e=errno;read_error=1;break;
@@ -324,23 +391,24 @@ child_failed:
     admission_diagnostic.startup_error=e;
     admission_diagnostic.received=(int)received;
     admission_diagnostic.child_pid=(long)c->pid;
-    if(received==sizeof e)admission_diagnostic.read_child_errno=e;
+    admission_diagnostic.session_acknowledged=c->session_established;
+    if(child_errno)admission_diagnostic.read_child_errno=child_errno;
     if(read_error)admission_failed_snapshot(admission[0],c->pid,e,received);
 #endif
     drop(&admission[0]);
     if (read_error) {
-      /* EOF was not observed, so application execution is uncertain. Retain
-       * ownership for checked session/group shutdown; never assume that only
-       * the direct child could exist after an admission-channel failure. */
+      /* Clean empty EOF above proves no exec and sets direct-only cleanup.
+       * Other admission errors leave execution uncertain. Retain the original
+       * handle; never infer private-group authority from a failed channel. */
       c->input=in[1];in[1]=-1;c->output=output[0];output[0]=-1;
       c->error=error[0];error[0]=-1;*out=c;return e;
     }
-    if (received || e) {
-      if (!e || received != sizeof e) e=EIO;
+    if (child_errno) {
+      e=child_errno;
       /* A complete child errno record proves no application was entered.
        * Retain the private child for bounded checked direct-child cleanup,
        * including setsid failure. A partial record is uncertain execution. */
-      c->failed_exec = received == sizeof e;
+      c->failed_exec = 1;
       c->input=in[1];in[1]=-1;c->output=output[0];output[0]=-1;
       c->error=error[0];error[0]=-1;*out=c;return e;
     }
@@ -427,19 +495,31 @@ int acp_owned_drained(acp_owned_posix_child *c) {
 static int signal_owned_group(acp_owned_posix_child *c, int signal_number) {
   int alive=leader_alive(c);
   if (alive < 0) return -alive;
+  if (!c->session_established) return ECHILD;
+  errno=0;pid_t session=getsid(c->pid);int session_errno=session<0?errno:0;
 #ifdef ACP_ADMISSION_DIAGNOSTICS
   admission_diagnostic.close_signal=signal_number;
   admission_diagnostic.close_session_attempted=1;
-  admission_diagnostic.close_session_result=(long)getsid(c->pid);
-  admission_diagnostic.close_session_errno=admission_diagnostic.close_session_result<0?errno:0;
-  if(admission_diagnostic.close_session_result!=c->pid)return ECHILD;
-  admission_diagnostic.close_group_attempted=1;
-  admission_diagnostic.close_group_result=(long)getpgid(c->pid);
-  admission_diagnostic.close_group_errno=admission_diagnostic.close_group_result<0?errno:0;
-  if(admission_diagnostic.close_group_result!=c->pid)return ECHILD;
-#else
-  if (getsid(c->pid) != c->pid || getpgid(c->pid) != c->pid) return ECHILD;
+  admission_diagnostic.close_session_result=(long)session;
+  admission_diagnostic.close_session_errno=session_errno;
 #endif
+  /* Darwin may no longer expose a zombie through proc_find. This exception
+   * requires a positive private session ack AND a fresh exact terminal child
+   * observation; an external reap or a live getter failure still refuses. */
+  if(session!=c->pid && !(session<0 && session_errno==ESRCH && leader_alive(c)==0))
+    return ECHILD;
+  errno=0;pid_t group=getpgid(c->pid);int group_errno=group<0?errno:0;
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_diagnostic.close_group_attempted=1;
+  admission_diagnostic.close_group_result=(long)group;
+  admission_diagnostic.close_group_errno=group_errno;
+#endif
+  if(group!=c->pid && !(group<0 && group_errno==ESRCH && leader_alive(c)==0))
+    return ECHILD;
+  /* Do not consume the original child. Its unreaped PID pins the admitted
+   * session/group number through the signal. A session leader cannot change
+   * groups. The caller's existing sole-waiter contract remains mandatory. */
+  alive=leader_alive(c);if(alive<0)return -alive;
   if (kill(-c->pid, signal_number) < 0 && errno != ESRCH) return errno;
   return 0;
 }

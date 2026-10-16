@@ -250,6 +250,37 @@ jobs:
           nix hash path --type sha256 --sri "$drv_source" > "$receipt/package-derivation-source-nar-hash.txt"
           "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); actual=open(sys.argv[2]).read().strip(); assert actual==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/package-derivation-source-nar-hash.txt"
 
+          # The standalone CLI package does not carry the RunQuota daemon.
+          # Select its public package through this exact SDK's locked input, so
+          # the SDK's follows graph and source revision govern the daemon too.
+          runtime_system="$("$receipt_python" -c 'import platform,sys; assert sys.platform=="linux"; machine=platform.machine(); assert machine in ("x86_64","aarch64","arm64"); print({"x86_64":"x86_64-linux","aarch64":"aarch64-linux","arm64":"aarch64-linux"}[machine])')"
+          runquota_expr="(builtins.getFlake \"github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d\").inputs.runquota-src.packages.$runtime_system.default"
+          nix build --no-link --json --no-update-lock-file --expr "$runquota_expr" > "$receipt/runquota-package-raw.json"
+          runquota_package="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["outputs"]["out"])' "$receipt/runquota-package-raw.json")"
+          runquota_drv="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["drvPath"])' "$receipt/runquota-package-raw.json")"
+          nix derivation show "$runquota_drv" > "$receipt/runquota-derivation-raw.json"
+          runquota_drv_source="$("$receipt_python" -c 'import json,sys; from pathlib import PurePosixPath; x=json.load(open(sys.argv[1])); assert len(x)==1; d=next(iter(x.values())); assert d["system"]==sys.argv[3]; assert d["outputs"]["out"]["path"] in (sys.argv[2],PurePosixPath(sys.argv[2]).name); print(d["env"]["src"])' "$receipt/runquota-derivation-raw.json" "$runquota_package" "$runtime_system")"
+          nix hash path --type sha256 --sri "$runquota_drv_source" > "$receipt/runquota-derivation-source-nar-hash.txt"
+          nix path-info --json --recursive "$runquota_package" > "$receipt/runquota-closure.json"
+          "$receipt_python" - "$source_root" "$receipt" "$runquota_package" "$runquota_drv" "$runtime_system" <<'PY_RUNQUOTA'
+          import hashlib,json,os,sys
+          from pathlib import Path
+          source,receipt,package,drv,system=sys.argv[1:];receipt=Path(receipt);package=Path(package)
+          lock=json.loads((Path(source)/'flake.lock').read_text());node=lock['nodes'][lock['nodes'][lock['root']]['inputs']['runquota-src']]['locked']
+          assert node['type']=='github' and node['owner']=='metacraft-labs' and node['repo']=='runquota' and len(node['rev'])==40
+          assert (receipt/'runquota-derivation-source-nar-hash.txt').read_text().strip()==node['narHash']
+          images={};expected_machine={'x86_64-linux':62,'aarch64-linux':183}[system]
+          for name in ('runquota','runquotad'):
+              executable=package/'bin'/name;assert executable.is_file() and os.access(executable,os.X_OK)
+              body=executable.read_bytes();assert body[:6]==b'\x7fELF\x02\x01' and int.from_bytes(body[18:20],'little')==expected_machine
+              images[name]=hashlib.sha256(body).hexdigest()
+          closure=json.loads((receipt/'runquota-closure.json').read_text());rows=closure if isinstance(closure,list) else [dict(value,path=key) for key,value in closure.items()]
+          assert any(row['path']==str(package) for row in rows)
+          (receipt/'runquota-identity.json').write_text(json.dumps({'selectedSDK':'76659f5730ecf698b1963c656494d2cb66eb256d','lockedRunQuotaInput':node,'system':system,'package':str(package),'drvPath':drv,'imagesSHA256':images,'closureSHA256':hashlib.sha256((receipt/'runquota-closure.json').read_bytes()).hexdigest()},indent=2)+'\n')
+          PY_RUNQUOTA
+          printf 'RUNQUOTAD_BIN=%s/bin/runquotad\n' "$runquota_package" >> "$GITHUB_ENV"
+          printf '%s/bin\n' "$runquota_package" >> "$GITHUB_PATH"
+
       - name: Retain Linux runtime source and package identities
         if: always() && matrix.os == 'linux' && steps.linux_runtime.outputs.receipt_path != ''
         uses: actions/upload-artifact@v4
