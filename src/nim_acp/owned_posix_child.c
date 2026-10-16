@@ -255,19 +255,37 @@ child_failed:
     int read_error=0;
     long long admission_start=millis();
     if(admission_start < 0) { e=errno;read_error=1; }
+    if(!read_error) {
+      int admission_flags=fcntl(admission[0],F_GETFL,0);
+      if(admission_flags < 0 ||
+          fcntl(admission[0],F_SETFL,admission_flags|O_NONBLOCK) < 0) {
+        e=errno;read_error=1;
+      }
+    }
     while (!read_error && received < sizeof e) {
       long long now=millis();
       if(now < 0) { e=errno;read_error=1;break; }
       long long remaining=admission_start+2000-now;
       if(remaining <= 0) { e=ETIMEDOUT;read_error=1;break; }
-      struct pollfd ready={admission[0],POLLIN,0};
-      int available=poll(&ready,1,(int)remaining);
-      if(available < 0) { if(errno==EINTR)continue;e=errno;read_error=1;break; }
-      if(!available) { e=ETIMEDOUT;read_error=1;break; }
+      /* Darwin FIFO poll can miss EOF after the CLOEXEC writer closes.
+       * The nonblocking read is authoritative; poll only bounds the next
+       * retry. A short poll timeout never replaces the absolute deadline. */
       ssize_t n=read(admission[0], dst+received, sizeof e-received);
-      if (n < 0) { if (errno==EINTR) continue; e=errno; read_error=1; break; }
       if (n == 0) break;
-      received+=(size_t)n;
+      if (n > 0) { received+=(size_t)n;continue; }
+      if (errno==EINTR) continue;
+      if (errno!=EAGAIN && errno!=EWOULDBLOCK) {
+        e=errno;read_error=1;break;
+      }
+      now=millis();
+      if(now < 0) { e=errno;read_error=1;break; }
+      remaining=admission_start+2000-now;
+      if(remaining <= 0) { e=ETIMEDOUT;read_error=1;break; }
+      struct pollfd ready={admission[0],POLLIN,0};
+      int available=poll(&ready,1,(int)(remaining < 10 ? remaining : 10));
+      if(available < 0 && errno!=EINTR) {
+        e=errno;read_error=1;break;
+      }
     }
 #ifdef ACP_ADMISSION_DIAGNOSTICS
     admission_diagnostic.startup_error=e;
