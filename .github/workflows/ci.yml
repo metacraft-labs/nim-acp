@@ -42,6 +42,11 @@ jobs:
       # `bash -e` WITHOUT pipefail, so `cmd | tee` takes tee's exit status and a
       # failing command was reported as a passing job. `shell: bash` selects
       # `bash --noprofile --norc -eo pipefail`.
+      - name: Authenticate and transition initial checkout Git samples
+        shell: bash
+        run: |
+          original_git="$(command -v git)"
+          nix run .#ci-initial-samples -- "$original_git"
       - run: nix develop --command just test 2>&1 | tee test.log
         shell: bash
       - uses: actions/upload-artifact@v4
@@ -74,6 +79,11 @@ jobs:
       # and then VERIFIES the features are live.
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
+      - name: Authenticate and transition initial checkout Git samples
+        shell: bash
+        run: |
+          original_git="$(command -v git)"
+          nix run .#ci-initial-samples -- "$original_git"
       - run: nix develop --command just lint 2>&1 | tee lint.log
         shell: bash
       - uses: actions/upload-artifact@v4

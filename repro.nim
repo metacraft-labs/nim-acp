@@ -131,6 +131,15 @@ package nim_acp:
     # Mirrors the nimble file's ``requires "nim >= 2.0.0"`` (the nix dev
     # shell supplies Nim 2.2.x).
     "nim >=2.0"
+    # The unchanged legacy cross-checks run Just and Nim's Node.js tests.
+    "just >=1"
+    "node >=20"
+    when defined(windows):
+      # The original stdio fixtures run their real child scripts with Bash.
+      "bash >=4"
+      # External commands executed by the unchanged Bash fixtures.
+      "cat"
+      "sleep"
     when defined(macosx):
       "clang >=14"
     else:
@@ -185,6 +194,13 @@ package nim_acp:
       let executeEdge = edge.testBinary.run(
         actionId = "nim_acp.test_execute." & stem,
         registerImplicitName = false)
+      when defined(windows):
+        if stem in ["test_inject_prompt", "test_send_with_stream"]:
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["bash"])
+        if stem == "test_inject_prompt":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["cat"])
+        if stem == "test_send_with_stream":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["sleep"])
       if stem == "test_nimcache_is_worktree_local":
         # This original test invokes the compiler recorded by its build.
         # Keep that runtime producer in the execute action's declared tools.

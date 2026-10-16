@@ -174,6 +174,11 @@
               ${ownRepoOnly guardedHookInstall}
             '';
           };
+          # Expose the owning constructor without activating its shell hook.
+          # The original checkout Git is passed explicitly by the CI step.
+          packages.ci-initial-samples = pkgs.writeShellScriptBin "nim-acp-initial-samples" ''
+            exec ${pkgs.python3}/bin/python3 ${./ci}/initialize-checkout-samples.py ${pkgs.git}/bin/git "$@"
+          '';
           packages.native-hook-config = preCommit.config.configFile;
           packages.legacy-native-hook-config = legacyPreCommit.config.configFile;
           packages.expected-native-hooks = expectedNativeHook;

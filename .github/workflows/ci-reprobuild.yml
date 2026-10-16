@@ -35,13 +35,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Capped to linux/x64: eph-linux-x64 is the only ephemeral runner
-          # pool that reliably comes online. The eph-linux-arm64 /
-          # eph-macos-arm64 / eph-win-x64 / eph-win-arm64 pools don't spin up
-          # and 24h-timeout; restore those legs once their pools are live.
+          # Required Reprobuild coverage; unavailable capacity stays queued.
+          # The separate Nix workflow retains its original three Unix legs.
           - os: linux
             arch: x64
             runner: [self-hosted, linux, x64]
+          - os: linux
+            arch: arm64
+            runner: [self-hosted, linux, arm64]
+          - os: macos
+            arch: arm64
+            runner: [self-hosted, macos, arm64]
+          - os: windows
+            arch: x64
+            runner: [self-hosted, windows, x64]
+          - os: windows
+            arch: arm64
+            runner: [self-hosted, windows, arm64]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -63,6 +73,16 @@ jobs:
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           owner: metacraft-labs
 
+      # Materialize the owning Git role without activating the guarded shell.
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        if: runner.os != 'Windows'
+      - name: Authenticate and transition initial checkout Git samples
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          original_git="$(command -v git)"
+          nix run .#ci-initial-samples -- "$original_git"
+
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
@@ -79,11 +99,24 @@ jobs:
           repro-publish-cert: ${{ secrets.REPRO_PUBLISH_CERT }}
 
       - name: Report exact Repro environment
+        if: runner.os != 'Windows'
         run: |
           pwd
           git rev-parse HEAD
           command -v repro
           repro --version
+
+      - name: Report exact Windows Repro environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-Location
+          git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Get-Command repro -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          repro --version
+          exit $LASTEXITCODE
 
       - name: repro build
         # Builds the conventional `build` collection declared in

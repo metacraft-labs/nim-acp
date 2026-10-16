@@ -1,11 +1,11 @@
 # Native concurrent injection and drain can crash
 
-| | |
-|---|---|
-| Status | open |
-| Recorded | 2026-10-03 |
-| Observed in | nim-acp @ `314e58407390e4e42264800f5377ae226851e1af` |
-| Area | `src/nim_acp/client.nim` injection queue; `tests/test_inject_prompt.nim` |
+|             |                                                                          |
+| ----------- | ------------------------------------------------------------------------ |
+| Status      | open                                                                     |
+| Recorded    | 2026-10-03                                                               |
+| Observed in | nim-acp @ `314e58407390e4e42264800f5377ae226851e1af`                     |
+| Area        | `src/nim_acp/client.nim` injection queue; `tests/test_inject_prompt.nim` |
 
 ## Observed
 
