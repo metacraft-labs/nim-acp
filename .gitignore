@@ -1,5 +1,5 @@
 .direnv/
-.pre-commit-config.yaml
+.pre-commit-config.nix.yaml
 nimcache/
 # Per-checkout nimcache (config.nims): every Nim compile in this checkout
 # keeps its intermediate files here, never in the shared ~/.cache/nim.
@@ -13,3 +13,6 @@ result
 # reprobuild local workspace state (repro writes .repro/ into member repos
 # too, but its ergonomics fixer only patches the workspace root)
 .repro/
+
+# Typed test binaries and compiler intermediates declared in repro.nim.
+/build/

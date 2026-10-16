@@ -6,6 +6,7 @@ when not defined(js):
   import std/[locks, options, os, osproc, streams, strutils, times]
   when defined(posix):
     import std/posix
+    import ./owned_posix_child
 
 type
   PendingInjection* = object
@@ -65,6 +66,8 @@ type
       ## (hard).  Default: 30 minutes.
     when not defined(js):
       process: Process
+      when defined(posix):
+        ownedChild: OwnedPosixChild
       stdinStream: Stream
       stdoutStream: Stream
       readBuffer: string
@@ -336,7 +339,8 @@ when not defined(js):
   proc newNativeStdioAcpTransport*(command: string; args: seq[string] = @[];
       defaultTimeoutMs = -1;
       idleTimeoutMs = DefaultNativeStdioTimeoutMs;
-      hardDeadlineMs = DefaultNativeStdioHardDeadlineMs):
+      hardDeadlineMs = DefaultNativeStdioHardDeadlineMs;
+      allowCommandOverride = true):
         NativeStdioAcpTransport =
     ## Spawn ``command args...`` and prepare a newline-delimited JSON-RPC
     ## pipe pair on its stdin/stdout. ``ISONIM_ACP_AGENT_CMD`` overrides
@@ -365,7 +369,7 @@ when not defined(js):
     ## the idle-reset behaviour.
     var resolvedCommand = command
     let envOverride = getEnv("ISONIM_ACP_AGENT_CMD")
-    if envOverride.len > 0:
+    if allowCommandOverride and envOverride.len > 0:
       resolvedCommand = envOverride
     if resolvedCommand.len == 0:
       raise newException(AcpError,
@@ -378,10 +382,21 @@ when not defined(js):
         "NativeStdioAcpTransport: command not found on PATH: " &
         resolvedCommand)
     var process: Process
+    var input: Stream
+    var output: Stream
+    when defined(posix):
+      var ownedChild: OwnedPosixChild
     try:
-      process = startProcess(resolved, args = args,
-        options = {poUsePath})
+      when defined(posix):
+        ownedChild = openOwnedPosixChild(resolved, args)
+      else:
+        process = startProcess(resolved, args = args,
+          options = {poUsePath})
+        input = process.inputStream()
+        output = process.outputStream()
     except OSError as e:
+      when defined(posix):
+        if e of OwnedPosixCleanupError: raise
       raise newException(AcpError,
         "NativeStdioAcpTransport: failed to spawn '" & resolved &
         "': " & e.msg)
@@ -394,22 +409,19 @@ when not defined(js):
       idleTimeoutMs: effectiveIdle,
       hardDeadlineMs: hardDeadlineMs,
       process: process,
-      stdinStream: process.inputStream(),
-      stdoutStream: process.outputStream())
+      stdinStream: input,
+      stdoutStream: output)
     when defined(posix):
-      # Make the child's stdout fd non-blocking so :proc:`readByte`
-      # returns control to the read loop on every poll quantum.  The
-      # idle/hard-deadline checks in :proc:`pumpUntil` would otherwise
-      # never get a chance to fire when the child stops emitting bytes
-      # (the read would block until EOF or the next byte arrives).
-      let fd = outputHandle(process)
-      let flags = fcntl(fd, F_GETFL, 0)
-      if flags >= 0:
-        discard fcntl(fd, F_SETFL, flags or O_NONBLOCK)
-    initLock(result.writeLock)
+      result.ownedChild = ownedChild
+    when not defined(posix): initLock(result.writeLock)
+
+  proc hasChild(transport: NativeStdioAcpTransport): bool =
+    when defined(posix): transport.ownedChild.isPresent()
+    else: transport.process != nil
 
   proc childAlive(transport: NativeStdioAcpTransport): bool =
-    transport.process != nil and transport.process.running
+    when defined(posix): transport.ownedChild.isAlive()
+    else: transport.process != nil and transport.process.running
 
   proc readByte(transport: NativeStdioAcpTransport): Option[char] =
     ## Single-byte read.
@@ -423,15 +435,11 @@ when not defined(js):
     ## EWOULDBLOCK return ``none(char)``; the loop polls and re-checks
     ## the deadlines.
     when defined(posix):
-      var ch: char
-      let fd = outputHandle(transport.process)
-      let n = posix.read(fd.cint, addr ch, 1)
-      if n == 1:
-        return some ch
-      # n == 0 → EOF (child closed stdout); n < 0 with EAGAIN/EWOULDBLOCK
-      # → momentarily nothing to read.  In both cases return ``none`` and
-      # let the caller's timeout / childAlive logic decide what to do.
-      return none(char)
+      try:
+        return transport.ownedChild.readByte()
+      except OwnedPosixClosedError:
+        raise newException(AcpTransportClosedError,
+          "ACP child '" & transport.command & "' closed its output")
     else:
       # Windows process pipes are named pipes. Avoid entering the
       # blocking stream read until PeekNamedPipe reports a byte ready.
@@ -537,11 +545,9 @@ when not defined(js):
         when defined(posix):
           var residualBuf = ""
           while true:
-            var ch: char
-            let fd = outputHandle(transport.process)
-            let n = posix.read(fd.cint, addr ch, 1)
-            if n <= 0: break
-            residualBuf.add ch
+            let next = transport.readByte()
+            if next.isNone: break
+            residualBuf.add next.get
           if residualBuf.len > 0:
             transport.readBuffer.add residualBuf
             continue
@@ -574,16 +580,26 @@ when not defined(js):
         sleep(5)
 
   proc writeFrame(transport: NativeStdioAcpTransport; payload: string) =
-    if transport.closed or not transport.childAlive():
-      raise newException(AcpTransportClosedError,
-        "ACP child '" & transport.command & "' is not running")
-    acquire(transport.writeLock)
-    try:
-      transport.stdinStream.write(payload)
-      transport.stdinStream.write("\n")
-      transport.stdinStream.flush()
-    finally:
-      release(transport.writeLock)
+    when defined(posix):
+      if not transport.childAlive():
+        raise newException(AcpTransportClosedError,
+          "ACP child '" & transport.command & "' is not running")
+      try:
+        transport.ownedChild.writeFrame(payload)
+      except OwnedPosixClosedError:
+        raise newException(AcpTransportClosedError,
+          "ACP child '" & transport.command & "' closed its input")
+    else:
+      if transport.closed or not transport.childAlive():
+        raise newException(AcpTransportClosedError,
+          "ACP child '" & transport.command & "' is not running")
+      acquire(transport.writeLock)
+      try:
+        transport.stdinStream.write(payload)
+        transport.stdinStream.write("\n")
+        transport.stdinStream.flush()
+      finally:
+        release(transport.writeLock)
 
   proc extractRequestId(payload: string): string =
     let node = parseJson(payload)
@@ -628,7 +644,7 @@ when not defined(js):
 
   method drain*(transport: NativeStdioAcpTransport): seq[string] =
     # Best-effort drain of any pending frames buffered since the last call.
-    if transport.process != nil and (transport.childAlive() or
+    if transport.hasChild() and (transport.childAlive() or
         transport.readBuffer.len > 0):
       try:
         # ``matchId == ""`` returns as soon as the buffer is empty; the
@@ -642,31 +658,37 @@ when not defined(js):
     transport.pendingNotifications.setLen(0)
 
   proc close*(transport: NativeStdioAcpTransport) =
-    ## Shut down the child. Idempotent.
-    if transport == nil or transport.closed:
-      return
-    transport.closed = true
-    if transport.process == nil:
-      return
-    try:
-      if transport.childAlive():
-        try:
-          # Closing stdin signals graceful EOF to most ACP agents
-          # (claude-code-acp included).
-          transport.stdinStream.close()
-        except CatchableError:
-          discard
-        # Give the child a moment to exit cleanly before SIGTERM.
-        let deadline = epochTime() + 1.0
-        while transport.childAlive() and epochTime() < deadline:
-          sleep(20)
+    ## POSIX shutdown owns an isolated session/group, not arbitrary detached
+    ## descendants. Failed cleanup remains explicit and the transport stays closed.
+    when defined(posix):
+      if transport == nil: return
+      transport.ownedChild.close(gracefulMs = 1000, terminalMs = 2000)
+    else:
+      if transport == nil or transport.closed:
+        return
+      transport.closed = true
+      if transport.process == nil:
+        return
+      try:
         if transport.childAlive():
-          try: transport.process.terminate() except CatchableError: discard
-        discard transport.process.waitForExit(timeout = 2_000)
-    except CatchableError:
-      discard
-    try: transport.process.close() except CatchableError: discard
-    deinitLock(transport.writeLock)
+          try:
+            # Closing stdin signals graceful EOF to most ACP agents
+            # (claude-code-acp included).
+            transport.stdinStream.close()
+          except CatchableError:
+            discard
+          # Give the child a moment to exit cleanly before SIGTERM.
+          let deadline = epochTime() + 1.0
+          while transport.childAlive() and epochTime() < deadline:
+            sleep(20)
+          if transport.childAlive():
+            try: transport.process.terminate() except CatchableError: discard
+          discard transport.process.waitForExit(timeout = 2_000)
+      except CatchableError:
+        discard
+      try: transport.process.close() except CatchableError: discard
+      deinitLock(transport.writeLock)
+
 
   method shutdown*(transport: NativeStdioAcpTransport) {.gcsafe.} =
     ## Dispatch-able alias for :proc:`close` so callers that only hold
@@ -799,10 +821,12 @@ proc initialize*(client: var AcpClient; req: InitializeRequest): InitializeRespo
   client.capabilitiesNegotiated = true
 
 proc startSession*(client: var AcpClient; req: NewSessionRequest): NewSessionResponse =
+  var params = %* {"cwd": req.cwd, "mcpServers": req.mcpServers}
+  if req.meta != nil: params["_meta"] = req.meta
   let response = decodeResponse(client.roundTrip(encodeRequest(JsonRpcRequest(
     id: client.requestId(),
     rpcMethod: "session/new",
-    params: %*{"cwd": req.cwd, "mcpServers": req.mcpServers}))))
+    params: params))))
   response.raiseIfError()
   NewSessionResponse(sessionId: response.result{"sessionId"}.getStr(""))
 

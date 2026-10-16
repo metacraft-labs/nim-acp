@@ -2,7 +2,7 @@
 # Entering this repository's dev shell from ANOTHER git repository writes
 # nothing into that repository.
 #
-# The dev shell's hook installs git hooks (`.pre-commit-config.yaml`, hooks
+# The dev shell's hook installs git hooks (`.pre-commit-config.nix.yaml`, hooks
 # under `.git/hooks`, `core.hooksPath`). git-hooks.nix aims them at
 # `git rev-parse --show-toplevel` of the CURRENT DIRECTORY, so without a guard
 # `nix develop /path/to/this-repo` run from a sibling checkout plants this
@@ -13,7 +13,7 @@
 # Asserted, from a scratch git repository and from a subdirectory of it: no
 # file or directory appears, no hook is
 # installed and `core.hooksPath` is untouched. As the positive control, entered
-# from inside this repository the hook still installs `.pre-commit-config.yaml`.
+# from inside this repository the hook still installs `.pre-commit-config.nix.yaml`.
 #
 #   bash tests/test_dev_shell_writes_nothing_elsewhere.sh
 set -euo pipefail
@@ -42,10 +42,27 @@ for dir in "$SCRATCH" "$SCRATCH/sub"; do
 done
 
 # Positive control: the guard must not stop the hook in this repository.
-if [ -L "$REPO/.pre-commit-config.yaml" ]; then rm -f "$REPO/.pre-commit-config.yaml"; fi
+# The committed portable configuration is source, separate from the native symlink.
+[ -f "$REPO/.pre-commit-config.yaml" ] && [ ! -L "$REPO/.pre-commit-config.yaml" ] \
+  || fail "control: the portable configuration is not a regular source file"
+git -C "$REPO" ls-files --error-unmatch .pre-commit-config.yaml >/dev/null \
+  || fail "control: the portable configuration is not tracked"
+portable_before="$(git -C "$REPO" hash-object .pre-commit-config.yaml)"
+if [ -L "$REPO/.pre-commit-config.nix.yaml" ]; then
+  [ "$(readlink "$REPO/.pre-commit-config.nix.yaml")" = "${NIM_ACP_FULL_HOOK_CONFIG:?declared native configuration missing}" ] \
+    || fail "control: refusing to remove a native link with another authority"
+  rm -f "$REPO/.pre-commit-config.nix.yaml"
+fi
 ( cd "$REPO" && nix develop "$REPO" --no-write-lock-file -c true ) >/dev/null 2>&1 \
   || fail "the dev shell did not start from this repository"
-[ -L "$REPO/.pre-commit-config.yaml" ] \
-  || fail "control: entered from this repository, the hook did not install .pre-commit-config.yaml"
+[ -L "$REPO/.pre-commit-config.nix.yaml" ] \
+  || fail "control: entered from this repository, the hook did not install .pre-commit-config.nix.yaml"
+
+[ -f "$REPO/.pre-commit-config.yaml" ] && [ ! -L "$REPO/.pre-commit-config.yaml" ] \
+  && [ "$(git -C "$REPO" hash-object .pre-commit-config.yaml)" = "$portable_before" ] \
+  || fail "control: native installation altered the portable source"
+native_target="$(readlink "$REPO/.pre-commit-config.nix.yaml")"
+[ "$native_target" = "${NIM_ACP_FULL_HOOK_CONFIG:?declared native configuration missing}" ] \
+  || fail "control: generated native configuration has another authority"
 
 echo "PASS: entered from another repository the dev shell writes nothing there; from this one it installs its hooks"
