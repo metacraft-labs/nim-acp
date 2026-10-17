@@ -81,11 +81,19 @@ try {
   }
   $compiler=Read-Held $exe 134217728 $false
   $sources=@()
-  foreach ($relative in @('lib\system\alloc.nim','lib\system\threads.nim','lib\system\threadlocalstorage.nim','lib\system\memalloc.nim','lib\system\seqs_v2.nim','lib\system\mm\arc.nim','lib\system\mm\orc.nim')) {
-    $sources+=Read-Held ([IO.Path]::Combine($root,$relative)) 1048576 $true
+  $missingSources=@()
+  foreach ($relative in @('lib\system.nim','lib\system\alloc.nim','lib\system\threads.nim','lib\std\typedthreads.nim','lib\std\private\threadtypes.nim','lib\system\threadlocalstorage.nim','lib\system\memalloc.nim','lib\system\seqs_v2.nim','lib\system\mm\arc.nim','lib\system\mm\orc.nim')) {
+    $sourcePath=[IO.Path]::Combine($root,$relative)
+    try { $sources+=Read-Held $sourcePath 1048576 $true }
+    catch [IO.FileNotFoundException] {
+      $missingSources+=[ordered]@{path=$sourcePath; observation='FileNotFound at post-failure observation; no source bytes or identity claimed'}
+    }
+    catch [IO.DirectoryNotFoundException] {
+      $missingSources+=[ordered]@{path=$sourcePath; observation='DirectoryNotFound at post-failure observation; no source bytes or identity claimed'}
+    }
   }
   $config=Read-Held ([IO.Path]::Combine($root,'config','nim.cfg')) 1048576 $false
-  [ordered]@{scope='Post-failure selected installed Nim source observations; not execution-time byte identity or allocator cause'; workflowSHA=$env:GITHUB_SHA; profileSHA256=$profileWitness.sha256; rawSelectedExecutable=$raw; recordedExecutableDigest=[string]$selected.resolvedExecutableDigest; recordedProfileFingerprint=[string]$selected.profileFingerprint; digestComparison='Recorded profile digest and observed SHA256 are separate algorithms; no equality inferred'; directories=$directories; compiler=$compiler; sources=$sources; config=$config; toolsExecuted=$false; PATHChanged=$false} | ConvertTo-Json -Depth 12
+  [ordered]@{scope='Post-failure selected installed Nim source observations; not execution-time byte identity or allocator cause'; workflowSHA=$env:GITHUB_SHA; profileSHA256=$profileWitness.sha256; rawSelectedExecutable=$raw; recordedExecutableDigest=[string]$selected.resolvedExecutableDigest; recordedProfileFingerprint=[string]$selected.profileFingerprint; digestComparison='Recorded profile digest and observed SHA256 are separate algorithms; no equality inferred'; directories=$directories; compiler=$compiler; sources=$sources; missingSources=$missingSources; allCandidateSourcesPresent=($missingSources.Count -eq 0); config=$config; toolsExecuted=$false; PATHChanged=$false} | ConvertTo-Json -Depth 12
 } finally {
   for ($i=$holds.Count-1; $i -ge 0; $i--) { $holds[$i].Dispose() }
 }
