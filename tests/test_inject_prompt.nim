@@ -78,15 +78,33 @@ proc spawnFakeAcpAgent(): NativeStdioAcpTransport =
 # --------------------------------------------------------------------------- #
 
 type
+  SharedDrainedEntry = object
+    bytes: pointer
+    length: int
   ConcurrencyState = object
     transport: AcpTransport
     sessionId: string
     iterations: int
     producerDone: Atomic[bool]
-    drained: seq[string]
+    drained: ptr UncheckedArray[SharedDrainedEntry]
+    drainedCount: int
     drainedLock: Lock
 
 var sharedState: ConcurrencyState
+
+proc retainDrainedText(text: string) =
+  doAssert sharedState.drainedCount < sharedState.iterations
+  let index = sharedState.drainedCount
+  let bytes = allocShared(max(1, text.len))
+  if bytes == nil: raise newException(OutOfMemDefect, "Drain result allocation failed")
+  if text.len > 0: copyMem(bytes, unsafeAddr text[0], text.len)
+  sharedState.drained[index] = SharedDrainedEntry(bytes: bytes, length: text.len)
+  inc sharedState.drainedCount
+
+proc drainedText(index: int): string =
+  let entry = sharedState.drained[index]
+  result = newString(entry.length)
+  if entry.length > 0: copyMem(addr result[0], entry.bytes, entry.length)
 
 proc producerThread() {.thread, gcsafe.} =
   {.cast(gcsafe).}:
@@ -102,7 +120,7 @@ proc consumerThread() {.thread, gcsafe.} =
       if batch.len > 0:
         acquire(sharedState.drainedLock)
         for entry in batch:
-          sharedState.drained.add entry.text
+          retainDrainedText(entry.text)
         release(sharedState.drainedLock)
       if sharedState.producerDone.load(moAcquire):
         # Producer is done — one final drain to capture anything that
@@ -112,7 +130,7 @@ proc consumerThread() {.thread, gcsafe.} =
         if tail.len > 0:
           acquire(sharedState.drainedLock)
           for entry in tail:
-            sharedState.drained.add entry.text
+            retainDrainedText(entry.text)
           release(sharedState.drainedLock)
         break
 
@@ -178,7 +196,15 @@ suite "injectUserMessage queue":
       transport: newStubTransport(),
       sessionId: "sid-concurrent",
       iterations: 1000,
-      drained: @[])
+      drained: cast[ptr UncheckedArray[SharedDrainedEntry]](
+        allocShared0(1000 * sizeof(SharedDrainedEntry))))
+    doAssert sharedState.drained != nil
+    defer:
+      for index in 0 ..< sharedState.drainedCount:
+        deallocShared(sharedState.drained[index].bytes)
+      deallocShared(sharedState.drained)
+      sharedState.drained = nil
+      sharedState.drainedCount = 0
     initLock(sharedState.drainedLock)
     sharedState.producerDone.store(false, moRelease)
     var producer: Thread[void]
@@ -191,10 +217,45 @@ suite "injectUserMessage queue":
     sharedState.producerDone.store(true, moRelease)
     joinThread(Thread[void](sys: consumer.sys))
     deinitLock(sharedState.drainedLock)
-    check sharedState.drained.len == sharedState.iterations
+    check sharedState.drainedCount == sharedState.iterations
     # FIFO per producer thread: msg-0, msg-1, ... msg-999.
     for i in 0 ..< sharedState.iterations:
-      check sharedState.drained[i] == "msg-" & $i
+      check drainedText(i) == "msg-" & $i
+
+  test "test_injections_survive_producer_exit_with_caller_owned_snapshots":
+    sharedState = ConcurrencyState(transport: newStubTransport(),
+      sessionId: "retained-after-producer", iterations: 3)
+    var producer: Thread[void]
+    createThread(producer, producerThread)
+    joinThread(Thread[void](sys: producer.sys))
+    # All native queued storage was allocated by a producer that has exited.
+    var first = sharedState.transport.peekQueuedInjections(sharedState.sessionId)
+    check first.len == 3
+    for index in 0 ..< first.len:
+      check first[index].text == "msg-" & $index
+    first[0].text[0] = 'X'
+    let retained = sharedState.transport.takeQueuedInjections(sharedState.sessionId)
+    check retained.len == 3
+    for index in 0 ..< retained.len:
+      check retained[index].text == "msg-" & $index
+    check sharedState.transport.takeQueuedInjections(sharedState.sessionId).len == 0
+    sharedState.transport.injectUserMessage("binary\0session", "")
+    sharedState.transport.injectUserMessage("other", "keep")
+    sharedState.transport.injectUserMessage("binary\0session", "a\0b")
+    let binary = sharedState.transport.takeQueuedInjections("binary\0session")
+    check binary.len == 2
+    check binary[0].text == ""
+    check binary[1].text == "a\0b"
+    check sharedState.transport.takeQueuedInjections("other")[0].text == "keep"
+    # Destruction must also safely release undrained producer-owned payloads.
+    sharedState.transport = newStubTransport()
+    createThread(producer, producerThread)
+    joinThread(Thread[void](sys: producer.sys))
+    let beforeDestroy = sharedState.transport.peekQueuedInjections(sharedState.sessionId)
+    sharedState.transport = nil
+    check beforeDestroy.len == 3
+    for index in 0 ..< beforeDestroy.len:
+      check beforeDestroy[index].text == "msg-" & $index
 
   test "test_inject_default_method_works_on_native_stdio_transport":
     ## :type:`NativeStdioAcpTransport` inherits the default queue

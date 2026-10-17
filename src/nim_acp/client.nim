@@ -17,20 +17,23 @@ type
     receivedAt*: float       # epochTime() when injected (native);
                              # 0.0 on JS where epochTime is unavailable
                              # in the same form.
-  AcpInjectionQueue* = ref object
-    ## Per-session FIFO queue of pending injections, protected by a
-    ## :type:`Lock` on native builds.  Two threads typically touch a
-    ## given queue: the daemon's HTTP handler thread (which appends
-    ## via :proc:`injectUserMessage`) and the campaign's worker
-    ## thread (which drains via :proc:`takeQueuedInjections`).
-    pending*: Table[string, seq[PendingInjection]]
-    when not defined(js):
-      lock*: Lock
-    initialized*: bool
+  SharedInjectionNode = object
+    next: ptr SharedInjectionNode
+    sessionLength, textLength: int
+    receivedAt: float
+  AcpInjectionQueue* = object
+    ## Native queued bytes use shared allocations, independent of the allocating
+    ## worker's thread-local heap. Only inject/take/peek access this storage.
+    when defined(js):
+      pending: Table[string, seq[PendingInjection]]
+    else:
+      head, tail: ptr SharedInjectionNode
+      lock: Lock
+    initialized: bool
 
   AcpTransport* = ref object of RootObj
     injectionQueue*: AcpInjectionQueue
-      ## Lazy-initialised on first injection or peek/take.  Lives on
+      ## Inline queue storage, initialized on first injection. Lives on
       ## the base class so any transport (native stdio, in-memory
       ## fake, browser port, …) inherits the same default queue
       ## behaviour for free.  Concrete transports MAY override the
@@ -160,6 +163,24 @@ type
       ## this doubles as the guard that stops an optional method being
       ## issued against an agent whose capabilities are simply unknown.
 
+when not defined(js):
+  proc `=copy`(destination: var AcpInjectionQueue; source: AcpInjectionQueue) {.error:
+      "Native injection queue storage has one transport owner".}
+
+  proc `=destroy`(queue: var AcpInjectionQueue) =
+    # Transport owners must join users before destruction, as for its other
+    # native resources. The remaining payloads need no departed worker heap.
+    var node = queue.head
+    while node != nil:
+      let following = node.next
+      deallocShared(node)
+      node = following
+    queue.head = nil
+    queue.tail = nil
+    if queue.initialized:
+      deinitLock(queue.lock)
+      queue.initialized = false
+
 method send*(transport: AcpTransport; request: string): string {.base.} =
   raise newException(AcpError, "AcpTransport.send is not implemented")
 
@@ -236,82 +257,115 @@ template withInjectionQueueReferenceAccess(body: untyped) =
     block:
       body
 
-proc ensureInjectionQueue(transport: AcpTransport): AcpInjectionQueue =
-  ## Caller holds the native reference-access lock through publication,
-  ## managed-reference use and destruction; JS is single-threaded.
-  if transport.injectionQueue == nil:
-    var queue = AcpInjectionQueue(pending: initTable[string, seq[PendingInjection]]())
-    when not defined(js):
-      initLock(queue.lock)
-    queue.initialized = true
-    transport.injectionQueue = queue
-  transport.injectionQueue
+proc ensureInjectionQueue(transport: AcpTransport): ptr AcpInjectionQueue =
+  ## Caller holds reference access through the operation; no managed queue
+  ## reference or worker-allocated container escapes that boundary.
+  result = addr transport.injectionQueue
+  if not result.initialized:
+    when defined(js):
+      result.pending = initTable[string, seq[PendingInjection]]()
+    else:
+      initLock(result.lock)
+    result.initialized = true
 
-when not defined(js):
-  template withInjectionLock(queue: AcpInjectionQueue; body: untyped) =
+template withInjectionLock(queue: ptr AcpInjectionQueue; body: untyped) =
+  when not defined(js):
     acquire(queue.lock)
     try:
       body
     finally:
       release(queue.lock)
-else:
-  template withInjectionLock(queue: AcpInjectionQueue; body: untyped) =
-    # Single-threaded on JS; no locking needed.
+  else:
     body
+
+when not defined(js):
+  proc nodeBytes(node: ptr SharedInjectionNode): ptr UncheckedArray[char] =
+    cast[ptr UncheckedArray[char]](cast[uint](node) + uint(sizeof(SharedInjectionNode)))
+
+  proc sameSession(node: ptr SharedInjectionNode; session: string): bool =
+    if node.sessionLength != session.len: return false
+    let bytes = nodeBytes(node)
+    for index in 0 ..< session.len:
+      if bytes[index] != session[index]: return false
+    true
+
+  proc copyInjection(node: ptr SharedInjectionNode): PendingInjection =
+    result.receivedAt = node.receivedAt
+    result.text = newString(node.textLength)
+    if node.textLength > 0:
+      copyMem(addr result.text[0], addr nodeBytes(node)[node.sessionLength], node.textLength)
 
 method injectUserMessage*(transport: AcpTransport;
     sessionId, text: string) {.base.} =
-  ## Default implementation: append ``text`` to the per-session FIFO
-  ## queue on ``transport``.  Thread-safe (acquires the queue's
-  ## :type:`Lock` on native builds; on JS the call is a no-op around
-  ## the table mutation since there is no concurrency).  Concrete
-  ## transports may override for richer behaviour (e.g. wire-level
-  ## interleaving), but :type:`NativeStdioAcpTransport` inherits this
-  ## default.
-  ##
-  ## ``text`` may be empty; an empty injection is still recorded so
-  ## the caller can use it as a "kick" signal.  The drain side
-  ## decides how to fold empty entries into the next prompt.
+  ## Append one entry to the session FIFO. Empty and embedded-NUL strings are
+  ## ordinary payloads. Native storage outlives any individual worker heap.
   withInjectionQueueReferenceAccess:
     let queue = ensureInjectionQueue(transport)
-    var entry = PendingInjection(text: text)
-    when not defined(js):
-      entry.receivedAt = epochTime()
     withInjectionLock(queue):
-      if not queue.pending.hasKey(sessionId):
-        queue.pending[sessionId] = @[]
-      queue.pending[sessionId].add entry
+      when defined(js):
+        queue.pending.mgetOrPut(sessionId, @[]).add PendingInjection(text: text)
+      else:
+        if sessionId.len > high(int) - sizeof(SharedInjectionNode) or
+            text.len > high(int) - sizeof(SharedInjectionNode) - sessionId.len:
+          raise newException(ValueError, "Injection payload size overflow")
+        let node = cast[ptr SharedInjectionNode](allocShared0(
+          sizeof(SharedInjectionNode) + sessionId.len + text.len))
+        if node == nil: raise newException(OutOfMemDefect, "Injection queue allocation failed")
+        node.sessionLength = sessionId.len
+        node.textLength = text.len
+        node.receivedAt = epochTime()
+        let bytes = nodeBytes(node)
+        if sessionId.len > 0: copyMem(addr bytes[0], unsafeAddr sessionId[0], sessionId.len)
+        if text.len > 0: copyMem(addr bytes[sessionId.len], unsafeAddr text[0], text.len)
+        if queue.tail == nil: queue.head = node
+        else: queue.tail.next = node
+        queue.tail = node
 
 method takeQueuedInjections*(transport: AcpTransport;
     sessionId: string): seq[PendingInjection] {.base.} =
-  ## Atomically drain the queue for ``sessionId`` — returns the
-  ## entries in FIFO order and clears them from the queue.  Called at
-  ## turn boundaries by the daemon.  Returns ``@[]`` if no pending
-  ## injections.  Thread-safe.
+  ## Drain atomically into caller-owned strings and sequence storage.
   withInjectionQueueReferenceAccess:
-    if transport.injectionQueue == nil:
-      return @[]
-    let queue = transport.injectionQueue
+    if not transport.injectionQueue.initialized: return @[]
+    let queue = addr transport.injectionQueue
     withInjectionLock(queue):
-      if queue.pending.hasKey(sessionId):
-        result = queue.pending[sessionId]
-        queue.pending[sessionId] = @[]
+      when defined(js):
+        if queue.pending.hasKey(sessionId):
+          result = queue.pending[sessionId]
+          queue.pending[sessionId] = @[]
       else:
-        result = @[]
+        # Copy the complete result before changing the queue, so allocation
+        # failure cannot silently consume a prefix of the session FIFO.
+        var node = queue.head
+        while node != nil:
+          if sameSession(node, sessionId): result.add copyInjection(node)
+          node = node.next
+        var previous: ptr SharedInjectionNode
+        node = queue.head
+        while node != nil:
+          let following = node.next
+          if sameSession(node, sessionId):
+            if previous == nil: queue.head = following
+            else: previous.next = following
+            if queue.tail == node: queue.tail = previous
+            deallocShared(node)
+          else:
+            previous = node
+          node = following
 
 method peekQueuedInjections*(transport: AcpTransport;
     sessionId: string): seq[PendingInjection] {.base.} =
-  ## Read-only inspection (for logging / debug).  Returns a copy of
-  ## the current queue without draining it.  Thread-safe.
+  ## Inspect without consuming. Native returned values own their bytes.
   withInjectionQueueReferenceAccess:
-    if transport.injectionQueue == nil:
-      return @[]
-    let queue = transport.injectionQueue
+    if not transport.injectionQueue.initialized: return @[]
+    let queue = addr transport.injectionQueue
     withInjectionLock(queue):
-      if queue.pending.hasKey(sessionId):
-        result = queue.pending[sessionId]
+      when defined(js):
+        if queue.pending.hasKey(sessionId): result = queue.pending[sessionId]
       else:
-        result = @[]
+        var node = queue.head
+        while node != nil:
+          if sameSession(node, sessionId): result.add copyInjection(node)
+          node = node.next
 
 when not defined(js):
   const

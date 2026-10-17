@@ -8,6 +8,39 @@ import unittest
 import nim_acp
 
 suite "nim-acp":
+  test "base injection queues preserve FIFO and sessions on this backend":
+    let transport = newFakeAcpTransport()
+    let independent = newFakeAcpTransport()
+    check transport.peekQueuedInjections("session-a").len == 0
+    check transport.takeQueuedInjections("session-a").len == 0
+    transport.injectUserMessage("session-a", "first")
+    transport.injectUserMessage("", "empty-session")
+    transport.injectUserMessage("session-b", "other")
+    transport.injectUserMessage("session-a", "")
+    transport.injectUserMessage("session-a", "binary\0payload")
+    independent.injectUserMessage("session-a", "independent")
+    let preview = transport.peekQueuedInjections("session-a")
+    check preview.len == 3
+    check preview[0].text == "first"
+    check preview[1].text == ""
+    check preview[2].text == "binary\0payload"
+    let drained = transport.takeQueuedInjections("session-a")
+    check drained.len == 3
+    check drained[0].text == "first"
+    check drained[1].text == ""
+    check drained[2].text == "binary\0payload"
+    check transport.peekQueuedInjections("session-a").len == 0
+    check transport.takeQueuedInjections("session-a").len == 0
+    let other = transport.takeQueuedInjections("session-b")
+    check other.len == 1
+    check other[0].text == "other"
+    let emptySession = transport.takeQueuedInjections("")
+    check emptySession.len == 1
+    check emptySession[0].text == "empty-session"
+    let separate = independent.takeQueuedInjections("session-a")
+    check separate.len == 1
+    check separate[0].text == "independent"
+
   test "connect wraps reusable transport abstractions":
     let fake = newFakeAcpTransport()
     var client = connect(AcpConnectConfig(kind: atkInMemory), fake)
