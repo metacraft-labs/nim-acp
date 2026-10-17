@@ -3,6 +3,7 @@
 `nim-acp` models the Agent Client Protocol in Nim and provides transport-neutral client helpers for native and JavaScript builds.
 
 Implemented operations:
+
 - `initialize`
 - `session/new`
 - `session/prompt`

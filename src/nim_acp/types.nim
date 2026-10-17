@@ -51,6 +51,8 @@ type
   NewSessionRequest* = object
     cwd*: string
     mcpServers*: seq[string]
+    meta*: JsonNode
+      ## Provider extensions such as Claude systemPrompt append.
   NewSessionResponse* = object
     sessionId*: string
   LoadSessionRequest* = object

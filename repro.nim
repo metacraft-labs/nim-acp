@@ -6,12 +6,10 @@
 ## transports. Its ``src/`` tree imports only the Nim stdlib and its own
 ## submodules (``src/nim_acp/{types,jsonrpc,client,fake}.nim`` under the
 ## ``src/nim_acp.nim`` umbrella); nothing under ``src/`` or ``tests/``
-## imports a workspace sibling. The ``--path:../nim-everywhere/src`` that
-## the repo's ``Justfile`` passes is the patched-Nim distribution's own
-## stdlib search root (part of the toolchain floor), not a build
-## dependency on the ``nim-everywhere`` *repo* — no nim-acp module
-## resolves a symbol from it. So the ``uses:`` block is just the
-## toolchain floor and there is no ``uses: "<sibling>"`` edge.
+## imports a workspace sibling. The legacy sibling search path and clone
+## were unused: Nim's stdlib comes from the declared compiler distribution,
+## and full native/JavaScript gates also run with that sibling unavailable.
+## The ``uses:`` block therefore declares only the toolchain floor.
 ##
 ## A Mode 1 / Mode 3 hybrid (per
 ## ``reprobuild-specs/Three-Mode-Convention-System.md``) modelled on the
@@ -35,10 +33,10 @@
 ##   halves into ``test`` so ``repro build test`` / ``repro test``
 ##   materialise the runnable closure.
 ##
-## **``--path:src``.** nim-acp has NO ``config.nims`` / ``nim.cfg`` — the
-## module search path (``--path:src``) is supplied by the repo's
-## ``Justfile`` (``paths := "--path:src ..."``), not a repo-local Nim
-## config. A bare ``nim c tests/test_acp.nim`` therefore fails with
+## **``--path:src``.** The existing ``config.nims`` owns worktree-local
+## compiler caches. The module search path (``--path:src``) is supplied by
+## the repo's ``Justfile``, so every typed edge retains that same explicit
+## module input. A bare ``nim c tests/test_acp.nim`` therefore fails with
 ## ``cannot open file: nim_acp``. So every BUILD edge below passes
 ## ``paths = @["src"]`` explicitly, which ``buildNimUnittest.build``
 ## forwards as ``--path:src`` (mirroring the ``nim.c`` typed-tool's
@@ -46,7 +44,7 @@
 ## engine's monitor tracks the transitively imported ``src/nim_acp/``
 ## modules and rebuilds when any of them change.
 ##
-## **Per-test platform gating.** All three test files run on this Linux
+## **Per-test platform gating.** All five test files run on this Linux
 ## host; the corpus mirrors what the repo's own ``just test-native``
 ## would run:
 ##
@@ -69,7 +67,12 @@
 ##     (``read``/``printf``/``sleep``). Native/POSIX; runs on this Linux
 ##     host.
 ##
-## None of the three is Windows- or macOS-only, so all three keep a
+##   * ``test_session_load.nim`` — the original session-load native test;
+##     its separate original JS recipe remains required too.
+##   * ``test_nimcache_is_worktree_local.nim`` — probes this real checkout's
+##     compiler config through the exact compiler recorded at build time.
+##
+## None of the five is Windows- or macOS-only, so all five keep a
 ## runnable edge on Linux. ``buildNimUnittest.build`` defaults
 ## ``threadsOn = true``, so every binary compiles ``--threads:on`` (the
 ## Justfile only spells it out for ``test_inject_prompt``; it is harmless
@@ -98,12 +101,16 @@ type
     binary: string
 
 const portableTestSpecs: seq[AcpTestSpec] = @[
-  # All three tests compile + run to exit 0 on this Linux host (native).
+  # All five original native recipes have compile and execute graph edges.
   # ``test_acp`` has no OS gate; ``test_inject_prompt`` is native-only
   # (``when defined(js): {.error.}``) and threaded; ``test_send_with_stream``
   # drives the native-only POSIX stdio transport. None is Win/macOS-only.
   AcpTestSpec(source: "tests/test_acp.nim",
     binary: "build/test-bin/test_acp"),
+  AcpTestSpec(source: "tests/test_session_load.nim",
+    binary: "build/test-bin/test_session_load"),
+  AcpTestSpec(source: "tests/test_nimcache_is_worktree_local.nim",
+    binary: "build/test-bin/test_nimcache_is_worktree_local"),
   AcpTestSpec(source: "tests/test_inject_prompt.nim",
     binary: "build/test-bin/test_inject_prompt"),
   AcpTestSpec(source: "tests/test_send_with_stream.nim",
@@ -124,7 +131,19 @@ package nim_acp:
     # Mirrors the nimble file's ``requires "nim >= 2.0.0"`` (the nix dev
     # shell supplies Nim 2.2.x).
     "nim >=2.0"
-    "gcc >=12"
+    # The unchanged legacy cross-checks run Just and Nim's Node.js tests.
+    "just >=1"
+    "node >=20"
+    when defined(windows):
+      # The original stdio fixtures run their real child scripts with Bash.
+      "bash >=4"
+      # External commands executed by the unchanged Bash fixtures.
+      "cat"
+      "sleep"
+    when defined(macosx):
+      "clang >=14"
+    else:
+      "gcc >=12"
 
   # Library declaration — the ``src/`` tree the ``Justfile`` puts on
   # ``--path`` is importable when this package is consumed via
@@ -152,7 +171,8 @@ package nim_acp:
         if lastSlash >= 0: binary[lastSlash + 1 .. ^1]
         else: binary
       # ``paths = @["src"]`` supplies the ``--path:src`` the repo's
-      # ``Justfile`` passes (nim-acp has no ``config.nims``); ``src`` is
+      # ``Justfile`` passes; the existing ``config.nims`` is a declared input.
+      # ``src`` is
       # an ``extraInput`` so the monitor tracks the transitively imported
       # ``src/nim_acp/`` modules.
       let edge = buildNimUnittest.build(
@@ -160,7 +180,12 @@ package nim_acp:
         binary = binary,
         paths = @["src"],
         actionId = "nim_acp.test_build." & stem,
-        extraInputs = @["src", "nim_acp.nimble"])
+        extraInputs = @["src", "nim_acp.nimble", "config.nims"])
+      # Bind Nim's real platform C backend to the compile action.
+      when defined(macosx):
+        appendRegisteredActionToolIdentityRefs(edge.action.id, ["clang"])
+      else:
+        appendRegisteredActionToolIdentityRefs(edge.action.id, ["gcc"])
       buildActions.add(edge.action)
       # ``registerImplicitName = false`` because the BUILD edge already
       # owns the binary basename as the implicit target name; the explicit
@@ -169,6 +194,17 @@ package nim_acp:
       let executeEdge = edge.testBinary.run(
         actionId = "nim_acp.test_execute." & stem,
         registerImplicitName = false)
+      when defined(windows):
+        if stem in ["test_inject_prompt", "test_send_with_stream"]:
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["bash"])
+        if stem == "test_inject_prompt":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["cat"])
+        if stem == "test_send_with_stream":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["sleep"])
+      if stem == "test_nimcache_is_worktree_local":
+        # This original test invokes the compiler recorded by its build.
+        # Keep that runtime producer in the execute action's declared tools.
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["nim"])
       executeActions.add(executeEdge)
 
     for spec in portableTestSpecs:

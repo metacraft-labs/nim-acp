@@ -15,79 +15,635 @@ concurrency:
 
 jobs:
   test:
+    defaults:
+      run:
+        working-directory: nim-acp
     strategy:
       fail-fast: false
       matrix:
-        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
+        runner:
+          [
+            [self-hosted, linux, x64],
+            [self-hosted, linux, arm64],
+            [self-hosted, macos, arm64],
+          ]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Preserve prior checkout and construct a fresh owning root
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            /* Preserve prior checkout authority; never execute its hooks or replace unknown nodes. */
+            const freshOwnedRoot = async function freshOwnedRoot({ core, io, workspace, temporary, repository }) {
+              const fs = require('fs'), path = require('path'), crypto = require('crypto');
+              const { execFileSync } = require('child_process');
+              if (process.platform === 'win32') throw new Error('POSIX constructor required');
+              if (repository !== 'metacraft-labs/nim-acp') throw new Error('Foreign event repository');
+              for (const key of ['GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_CONFIG_PARAMETERS','GIT_CONFIG_COUNT'])
+                if (process.env[key]) throw new Error('Inherited Git selector');
+              const uid = BigInt(process.geteuid());
+              const heldDirectories=[];
+              const hold=p=>{const expected=directory(p),fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);heldDirectories.push({path:p,fd,expected});assertHeld();};
+              const assertHeld=()=>{for(const h of heldDirectories){const st=fs.fstatSync(h.fd,{bigint:true});if(st.dev.toString()!==h.expected.dev||st.ino.toString()!==h.expected.ino||!same(principal(h.path),h.expected))throw new Error('Held directory authority drift');}};
+              const principal = (p) => {
+                const s = fs.lstatSync(p, {bigint:true});
+                return { dev:s.dev.toString(), ino:s.ino.toString(), uid:s.uid.toString(), gid:s.gid.toString(), mode:s.mode.toString() };
+              };
+              const directory = (p) => {
+                if (!path.isAbsolute(p) || path.resolve(p) !== p || p === path.parse(p).root)
+                  throw new Error('Invalid directory path');
+                for (let a=p;;a=path.dirname(a)) {
+                  const s=fs.lstatSync(a,{bigint:true});
+                  if (!s.isDirectory() || s.isSymbolicLink()) throw new Error('Symlink or non-directory ancestry');
+                  if (a===path.dirname(a)) break;
+                }
+                if (fs.realpathSync(p)!==p || fs.lstatSync(p,{bigint:true}).uid!==uid) throw new Error('Foreign directory owner');
+                return principal(p);
+              };
+              const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+              const exists=(p)=>{try {fs.lstatSync(p);return true;}catch(e){if(e.code==='ENOENT')return false;throw e;}};
+              try {
+              const wp=directory(workspace), tp=directory(temporary), parent=path.dirname(workspace), pp=directory(parent);
+              if (workspace===temporary || workspace.startsWith(temporary+path.sep) || temporary.startsWith(workspace+path.sep)) throw new Error('Nested roots');
+              process.chdir(temporary);
+              hold(workspace);hold(temporary);hold(parent);
+              const sourceRoot=exists(path.join(workspace,'.git'))?workspace:path.join(workspace,'nim-acp');
+              const gitdir=path.join(sourceRoot,'.git');
+              if (!exists(gitdir)) {
+                if (fs.readdirSync(workspace).length) throw new Error('Unknown non-repository workspace');
+                core.info('Initial empty owning workspace retained'); return;
+              }
+              directory(sourceRoot); directory(gitdir);
+              if (exists(path.join(gitdir,'commondir')) || exists(path.join(gitdir,'objects/info/alternates'))) throw new Error('Shared Git authority');
+              const image=await io.which('git',true);
+              const run=(args)=>execFileSync(image,['--no-optional-locks','-C',sourceRoot,...args],{env:{...process.env,GIT_OPTIONAL_LOCKS:'0',GIT_NO_LAZY_FETCH:'1'},encoding:'utf8'});
+              const origin=run(['config','--no-includes','--local','--get','remote.origin.url']).trim();
+              if (!['https://github.com/'+repository,'https://github.com/'+repository+'.git','git@github.com:'+repository+'.git'].includes(origin)) throw new Error('Foreign origin');
+              if (run(['rev-parse','--show-toplevel']).trim()!==sourceRoot) throw new Error('Foreign worktree root');
+              const file=(p)=> {
+                const before=fs.lstatSync(p,{bigint:true});
+                if (before.isSymbolicLink()) {
+                  const original=principal(p),target=fs.readlinkSync(p,{encoding:'buffer'}).toString('hex');
+                  if(!same(principal(p),original)) throw new Error('Source symlink changed');
+                  return {principal:original,target};
+                }
+                if (!before.isFile()) throw new Error('Non-regular source');
+                const fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+                try {
+                  const opened=fs.fstatSync(fd,{bigint:true});
+                  if (opened.dev!==before.dev||opened.ino!==before.ino) throw new Error('Source replaced');
+                  const bytes=fs.readFileSync(fd), after=fs.fstatSync(fd,{bigint:true});
+                  if (after.size!==opened.size||after.mtimeNs!==opened.mtimeNs||!same(principal(p),principalFromStat(opened))) throw new Error('Source changed');
+                  return {principal:principal(p),sha256:crypto.createHash('sha256').update(bytes).digest('hex')};
+                } finally {fs.closeSync(fd);}
+              };
+              const principalFromStat=s=>({dev:s.dev.toString(),ino:s.ino.toString(),uid:s.uid.toString(),gid:s.gid.toString(),mode:s.mode.toString()});
+              const identity=()=> {
+                const entries=run(['ls-files','--stage','-z']).split('\0').filter(Boolean), tracked={};
+                for(const row of entries) {
+                  if(row.startsWith('160000 ')) throw new Error('Unsupported gitlink');
+                  const name=row.slice(row.indexOf('\t')+1);
+                  if (!name || path.isAbsolute(name) || name.split('/').includes('..')) throw new Error('Invalid source member');
+                  tracked[name]=file(path.join(sourceRoot,name));
+                }
+                return {root:directory(workspace),sourceRoot:directory(sourceRoot),git:directory(gitdir),head:run(['rev-parse','--verify','HEAD']).trim(),entries,config:file(path.join(gitdir,'config')),index:file(path.join(gitdir,'index')),tracked};
+              };
+              for(const p of [path.join(gitdir,'config'),path.join(gitdir,'index')]) if(!fs.lstatSync(p).isFile()||fs.lstatSync(p).isSymbolicLink()) throw new Error('Git metadata kind');
+              const before=identity();
+              if(!/^[0-9a-f]{40}$/.test(before.head)) throw new Error('Invalid source HEAD');
+              if (!same(directory(parent),pp)||!same(directory(workspace),wp)||!same(directory(temporary),tp)) throw new Error('Directory authority changed');
+              assertHeld();
+              const held=fs.mkdtempSync(path.join(parent,'.acp-preserved-checkout-'));
+              const hp=directory(held);
+              if ((BigInt(hp.mode)&0o777n)!==0o700n || hp.dev!==wp.dev) throw new Error('Nonexclusive or cross-device preservation');
+              const destination=path.join(held,'workspace');
+              if(exists(destination)) throw new Error('Occupied preservation destination');
+              if(!same(identity(),before)||!same(directory(parent),pp)||!same(directory(held),hp)) throw new Error('Pre-rename authority drift');
+              assertHeld();
+              fs.renameSync(workspace,destination);
+              for(const h of heldDirectories)if(h.path===workspace||h.path.startsWith(workspace+path.sep))h.path=destination+h.path.slice(workspace.length);
+              if(!same(directory(destination),wp)) throw new Error('Preserved root identity drift');
+              try {fs.mkdirSync(workspace,{mode:Number(BigInt(wp.mode)&0o777n)});}
+              catch(error) {
+                if(exists(workspace)) throw new Error('Occupied rollback destination; preserved checkout retained');
+                if(!same(directory(destination),wp)||!same(directory(parent),pp)) throw new Error('Rollback authority drift');
+                fs.renameSync(destination,workspace); throw new Error('Root creation failed; original checkout restored');
+              }
+              assertHeld();directory(workspace);
+              core.info('Fresh owning root created; exact previous checkout retained at '+JSON.stringify(destination));
+              } finally {for(const h of heldDirectories)fs.closeSync(h.fd);}
+            };
+
+            await freshOwnedRoot({ core, io, workspace:process.env.GITHUB_WORKSPACE, temporary:process.env.RUNNER_TEMP, repository:process.env.GITHUB_REPOSITORY });
+
       - uses: actions/checkout@v4
         with:
-          repository: metacraft-labs/nim-everywhere
-          path: ../nim-everywhere
+          path: nim-acp
+      - name: Bind checkout-time Git constructor
+        id: checkout_git
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7, supplied Node 20 runtime
+        with:
+          script: |
+            const root = require("path").join(process.env.GITHUB_WORKSPACE, "nim-acp");
+            const bind = require(require("path").join(root, "ci", "bind-checkout-creator.cjs"));
+            await bind({ core, io, root });
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          nix-github-token: ${{ github.token }}
+          substituter-preflight: fail
       # `shell: bash` is load-bearing, not style. The default `run` shell is
       # `bash -e` WITHOUT pipefail, so `cmd | tee` takes tee's exit status and a
       # failing command was reported as a passing job. `shell: bash` selects
       # `bash --noprofile --norc -eo pipefail`.
-      - run: nix develop --command just test 2>&1 | tee test.log
+      - name: Authenticate and transition initial checkout Git samples
+        shell: bash
+        run: |
+          nix run .#ci-initial-samples -- --creator-binding "${{ steps.checkout_git.outputs.binding }}"
+      - name: Observe Linux kernel limits before the owning phase
+        id: linux_resources_before
+        if: runner.os == 'Linux'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'before',temporary:process.env.RUNNER_TEMP,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - id: original_tests
+        run: nix develop --command just test 2>&1 | tee test.log
+        shell: bash
+      - name: Observe Linux kernel limits after the owning phase
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+          ACP_KERNEL_RECEIPT: ${{ steps.linux_resources_before.outputs.receipt_path }}
+          ACP_KERNEL_DIRECTORY_IDENTITY: ${{ steps.linux_resources_before.outputs.directory_identity }}
+          ACP_KERNEL_BEFORE_SHA256: ${{ steps.linux_resources_before.outputs.snapshot_sha256 }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'after',temporary:process.env.RUNNER_TEMP,receipt:process.env.ACP_KERNEL_RECEIPT,directoryIdentity:process.env.ACP_KERNEL_DIRECTORY_IDENTITY,beforeSHA:process.env.ACP_KERNEL_BEFORE_SHA256,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Retain bounded public Linux kernel observations
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-linux-kernel-${{ github.job }}-${{ runner.arch }}
+          path: |
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
+          if-no-files-found: warn
+      - name: Qualify native owned process group outcomes
+        if: ${{ always() && (steps.original_tests.outcome == 'success' || steps.original_tests.outcome == 'failure') }}
+        run: nix develop --command bash tools/test-owned-posix-group-outcomes.sh 2>&1 | tee native-group-controls.log
+        shell: bash
+      - name: Retain native process group control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-group-controls-${{ join(matrix.runner, '-') }}
+          path: nim-acp/native-group-controls.log
+          if-no-files-found: warn
+      - name: Observe native Darwin admission after original test failure
+        if: ${{ failure() && runner.os == 'macOS' && steps.original_tests.outcome == 'failure' }}
+        run: nix develop --command nim c -r -d:acpAdmissionDiagnostics --nimcache:.nimcache/tests/acp-admission-diagnostic --out:build/test_send_with_stream_admission_diagnostic --path:src tests/test_send_with_stream.nim 2>&1 | tee admission-diagnostic.log
         shell: bash
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-log-${{ join(matrix.runner, '-') }}
-          path: test.log
+          path: nim-acp/test.log
+      - name: Retain native admission diagnostic log
+        if: ${{ always() && runner.os == 'macOS' && steps.original_tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-diagnostic-${{ join(matrix.runner, '-') }}
+          path: nim-acp/admission-diagnostic.log
+          if-no-files-found: warn
+
   lint:
+    defaults:
+      run:
+        working-directory: nim-acp
     strategy:
       fail-fast: false
       matrix:
-        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
+        runner:
+          [
+            [self-hosted, linux, x64],
+            [self-hosted, linux, arm64],
+            [self-hosted, macos, arm64],
+          ]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Preserve prior checkout and construct a fresh owning root
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            /* Preserve prior checkout authority; never execute its hooks or replace unknown nodes. */
+            const freshOwnedRoot = async function freshOwnedRoot({ core, io, workspace, temporary, repository }) {
+              const fs = require('fs'), path = require('path'), crypto = require('crypto');
+              const { execFileSync } = require('child_process');
+              if (process.platform === 'win32') throw new Error('POSIX constructor required');
+              if (repository !== 'metacraft-labs/nim-acp') throw new Error('Foreign event repository');
+              for (const key of ['GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_CONFIG_PARAMETERS','GIT_CONFIG_COUNT'])
+                if (process.env[key]) throw new Error('Inherited Git selector');
+              const uid = BigInt(process.geteuid());
+              const heldDirectories=[];
+              const hold=p=>{const expected=directory(p),fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);heldDirectories.push({path:p,fd,expected});assertHeld();};
+              const assertHeld=()=>{for(const h of heldDirectories){const st=fs.fstatSync(h.fd,{bigint:true});if(st.dev.toString()!==h.expected.dev||st.ino.toString()!==h.expected.ino||!same(principal(h.path),h.expected))throw new Error('Held directory authority drift');}};
+              const principal = (p) => {
+                const s = fs.lstatSync(p, {bigint:true});
+                return { dev:s.dev.toString(), ino:s.ino.toString(), uid:s.uid.toString(), gid:s.gid.toString(), mode:s.mode.toString() };
+              };
+              const directory = (p) => {
+                if (!path.isAbsolute(p) || path.resolve(p) !== p || p === path.parse(p).root)
+                  throw new Error('Invalid directory path');
+                for (let a=p;;a=path.dirname(a)) {
+                  const s=fs.lstatSync(a,{bigint:true});
+                  if (!s.isDirectory() || s.isSymbolicLink()) throw new Error('Symlink or non-directory ancestry');
+                  if (a===path.dirname(a)) break;
+                }
+                if (fs.realpathSync(p)!==p || fs.lstatSync(p,{bigint:true}).uid!==uid) throw new Error('Foreign directory owner');
+                return principal(p);
+              };
+              const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+              const exists=(p)=>{try {fs.lstatSync(p);return true;}catch(e){if(e.code==='ENOENT')return false;throw e;}};
+              try {
+              const wp=directory(workspace), tp=directory(temporary), parent=path.dirname(workspace), pp=directory(parent);
+              if (workspace===temporary || workspace.startsWith(temporary+path.sep) || temporary.startsWith(workspace+path.sep)) throw new Error('Nested roots');
+              process.chdir(temporary);
+              hold(workspace);hold(temporary);hold(parent);
+              const sourceRoot=exists(path.join(workspace,'.git'))?workspace:path.join(workspace,'nim-acp');
+              const gitdir=path.join(sourceRoot,'.git');
+              if (!exists(gitdir)) {
+                if (fs.readdirSync(workspace).length) throw new Error('Unknown non-repository workspace');
+                core.info('Initial empty owning workspace retained'); return;
+              }
+              directory(sourceRoot); directory(gitdir);
+              if (exists(path.join(gitdir,'commondir')) || exists(path.join(gitdir,'objects/info/alternates'))) throw new Error('Shared Git authority');
+              const image=await io.which('git',true);
+              const run=(args)=>execFileSync(image,['--no-optional-locks','-C',sourceRoot,...args],{env:{...process.env,GIT_OPTIONAL_LOCKS:'0',GIT_NO_LAZY_FETCH:'1'},encoding:'utf8'});
+              const origin=run(['config','--no-includes','--local','--get','remote.origin.url']).trim();
+              if (!['https://github.com/'+repository,'https://github.com/'+repository+'.git','git@github.com:'+repository+'.git'].includes(origin)) throw new Error('Foreign origin');
+              if (run(['rev-parse','--show-toplevel']).trim()!==sourceRoot) throw new Error('Foreign worktree root');
+              const file=(p)=> {
+                const before=fs.lstatSync(p,{bigint:true});
+                if (before.isSymbolicLink()) {
+                  const original=principal(p),target=fs.readlinkSync(p,{encoding:'buffer'}).toString('hex');
+                  if(!same(principal(p),original)) throw new Error('Source symlink changed');
+                  return {principal:original,target};
+                }
+                if (!before.isFile()) throw new Error('Non-regular source');
+                const fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+                try {
+                  const opened=fs.fstatSync(fd,{bigint:true});
+                  if (opened.dev!==before.dev||opened.ino!==before.ino) throw new Error('Source replaced');
+                  const bytes=fs.readFileSync(fd), after=fs.fstatSync(fd,{bigint:true});
+                  if (after.size!==opened.size||after.mtimeNs!==opened.mtimeNs||!same(principal(p),principalFromStat(opened))) throw new Error('Source changed');
+                  return {principal:principal(p),sha256:crypto.createHash('sha256').update(bytes).digest('hex')};
+                } finally {fs.closeSync(fd);}
+              };
+              const principalFromStat=s=>({dev:s.dev.toString(),ino:s.ino.toString(),uid:s.uid.toString(),gid:s.gid.toString(),mode:s.mode.toString()});
+              const identity=()=> {
+                const entries=run(['ls-files','--stage','-z']).split('\0').filter(Boolean), tracked={};
+                for(const row of entries) {
+                  if(row.startsWith('160000 ')) throw new Error('Unsupported gitlink');
+                  const name=row.slice(row.indexOf('\t')+1);
+                  if (!name || path.isAbsolute(name) || name.split('/').includes('..')) throw new Error('Invalid source member');
+                  tracked[name]=file(path.join(sourceRoot,name));
+                }
+                return {root:directory(workspace),sourceRoot:directory(sourceRoot),git:directory(gitdir),head:run(['rev-parse','--verify','HEAD']).trim(),entries,config:file(path.join(gitdir,'config')),index:file(path.join(gitdir,'index')),tracked};
+              };
+              for(const p of [path.join(gitdir,'config'),path.join(gitdir,'index')]) if(!fs.lstatSync(p).isFile()||fs.lstatSync(p).isSymbolicLink()) throw new Error('Git metadata kind');
+              const before=identity();
+              if(!/^[0-9a-f]{40}$/.test(before.head)) throw new Error('Invalid source HEAD');
+              if (!same(directory(parent),pp)||!same(directory(workspace),wp)||!same(directory(temporary),tp)) throw new Error('Directory authority changed');
+              assertHeld();
+              const held=fs.mkdtempSync(path.join(parent,'.acp-preserved-checkout-'));
+              const hp=directory(held);
+              if ((BigInt(hp.mode)&0o777n)!==0o700n || hp.dev!==wp.dev) throw new Error('Nonexclusive or cross-device preservation');
+              const destination=path.join(held,'workspace');
+              if(exists(destination)) throw new Error('Occupied preservation destination');
+              if(!same(identity(),before)||!same(directory(parent),pp)||!same(directory(held),hp)) throw new Error('Pre-rename authority drift');
+              assertHeld();
+              fs.renameSync(workspace,destination);
+              for(const h of heldDirectories)if(h.path===workspace||h.path.startsWith(workspace+path.sep))h.path=destination+h.path.slice(workspace.length);
+              if(!same(directory(destination),wp)) throw new Error('Preserved root identity drift');
+              try {fs.mkdirSync(workspace,{mode:Number(BigInt(wp.mode)&0o777n)});}
+              catch(error) {
+                if(exists(workspace)) throw new Error('Occupied rollback destination; preserved checkout retained');
+                if(!same(directory(destination),wp)||!same(directory(parent),pp)) throw new Error('Rollback authority drift');
+                fs.renameSync(destination,workspace); throw new Error('Root creation failed; original checkout restored');
+              }
+              assertHeld();directory(workspace);
+              core.info('Fresh owning root created; exact previous checkout retained at '+JSON.stringify(destination));
+              } finally {for(const h of heldDirectories)fs.closeSync(h.fd);}
+            };
+
+            await freshOwnedRoot({ core, io, workspace:process.env.GITHUB_WORKSPACE, temporary:process.env.RUNNER_TEMP, repository:process.env.GITHUB_REPOSITORY });
+
       - uses: actions/checkout@v4
         with:
-          repository: metacraft-labs/nim-everywhere
-          path: ../nim-everywhere
+          path: nim-acp
+      - name: Bind checkout-time Git constructor
+        id: checkout_git
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7, supplied Node 20 runtime
+        with:
+          script: |
+            const root = require("path").join(process.env.GITHUB_WORKSPACE, "nim-acp");
+            const bind = require(require("path").join(root, "ci", "bind-checkout-creator.cjs"));
+            await bind({ core, io, root });
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          nix-github-token: ${{ github.token }}
+          substituter-preflight: fail
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
+      - name: Authenticate and transition initial checkout Git samples
+        shell: bash
+        run: |
+          nix run .#ci-initial-samples -- --creator-binding "${{ steps.checkout_git.outputs.binding }}"
+      - name: Observe Linux kernel limits before the owning phase
+        id: linux_resources_before
+        if: runner.os == 'Linux'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'before',temporary:process.env.RUNNER_TEMP,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
       - run: nix develop --command just lint 2>&1 | tee lint.log
         shell: bash
+      - name: Observe Linux kernel limits after the owning phase
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+          ACP_KERNEL_RECEIPT: ${{ steps.linux_resources_before.outputs.receipt_path }}
+          ACP_KERNEL_DIRECTORY_IDENTITY: ${{ steps.linux_resources_before.outputs.directory_identity }}
+          ACP_KERNEL_BEFORE_SHA256: ${{ steps.linux_resources_before.outputs.snapshot_sha256 }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'after',temporary:process.env.RUNNER_TEMP,receipt:process.env.ACP_KERNEL_RECEIPT,directoryIdentity:process.env.ACP_KERNEL_DIRECTORY_IDENTITY,beforeSHA:process.env.ACP_KERNEL_BEFORE_SHA256,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Retain bounded public Linux kernel observations
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-linux-kernel-${{ github.job }}-${{ runner.arch }}
+          path: |
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: lint-log-${{ join(matrix.runner, '-') }}
-          path: lint.log
+          path: nim-acp/lint.log
   nix-build:
+    defaults:
+      run:
+        working-directory: nim-acp
     strategy:
       fail-fast: false
       matrix:
-        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
+        runner:
+          [
+            [self-hosted, linux, x64],
+            [self-hosted, linux, arm64],
+            [self-hosted, macos, arm64],
+          ]
     runs-on: ${{ matrix.runner }}
     steps:
+      - name: Preserve prior checkout and construct a fresh owning root
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            /* Preserve prior checkout authority; never execute its hooks or replace unknown nodes. */
+            const freshOwnedRoot = async function freshOwnedRoot({ core, io, workspace, temporary, repository }) {
+              const fs = require('fs'), path = require('path'), crypto = require('crypto');
+              const { execFileSync } = require('child_process');
+              if (process.platform === 'win32') throw new Error('POSIX constructor required');
+              if (repository !== 'metacraft-labs/nim-acp') throw new Error('Foreign event repository');
+              for (const key of ['GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_CONFIG_PARAMETERS','GIT_CONFIG_COUNT'])
+                if (process.env[key]) throw new Error('Inherited Git selector');
+              const uid = BigInt(process.geteuid());
+              const heldDirectories=[];
+              const hold=p=>{const expected=directory(p),fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);heldDirectories.push({path:p,fd,expected});assertHeld();};
+              const assertHeld=()=>{for(const h of heldDirectories){const st=fs.fstatSync(h.fd,{bigint:true});if(st.dev.toString()!==h.expected.dev||st.ino.toString()!==h.expected.ino||!same(principal(h.path),h.expected))throw new Error('Held directory authority drift');}};
+              const principal = (p) => {
+                const s = fs.lstatSync(p, {bigint:true});
+                return { dev:s.dev.toString(), ino:s.ino.toString(), uid:s.uid.toString(), gid:s.gid.toString(), mode:s.mode.toString() };
+              };
+              const directory = (p) => {
+                if (!path.isAbsolute(p) || path.resolve(p) !== p || p === path.parse(p).root)
+                  throw new Error('Invalid directory path');
+                for (let a=p;;a=path.dirname(a)) {
+                  const s=fs.lstatSync(a,{bigint:true});
+                  if (!s.isDirectory() || s.isSymbolicLink()) throw new Error('Symlink or non-directory ancestry');
+                  if (a===path.dirname(a)) break;
+                }
+                if (fs.realpathSync(p)!==p || fs.lstatSync(p,{bigint:true}).uid!==uid) throw new Error('Foreign directory owner');
+                return principal(p);
+              };
+              const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+              const exists=(p)=>{try {fs.lstatSync(p);return true;}catch(e){if(e.code==='ENOENT')return false;throw e;}};
+              try {
+              const wp=directory(workspace), tp=directory(temporary), parent=path.dirname(workspace), pp=directory(parent);
+              if (workspace===temporary || workspace.startsWith(temporary+path.sep) || temporary.startsWith(workspace+path.sep)) throw new Error('Nested roots');
+              process.chdir(temporary);
+              hold(workspace);hold(temporary);hold(parent);
+              const sourceRoot=exists(path.join(workspace,'.git'))?workspace:path.join(workspace,'nim-acp');
+              const gitdir=path.join(sourceRoot,'.git');
+              if (!exists(gitdir)) {
+                if (fs.readdirSync(workspace).length) throw new Error('Unknown non-repository workspace');
+                core.info('Initial empty owning workspace retained'); return;
+              }
+              directory(sourceRoot); directory(gitdir);
+              if (exists(path.join(gitdir,'commondir')) || exists(path.join(gitdir,'objects/info/alternates'))) throw new Error('Shared Git authority');
+              const image=await io.which('git',true);
+              const run=(args)=>execFileSync(image,['--no-optional-locks','-C',sourceRoot,...args],{env:{...process.env,GIT_OPTIONAL_LOCKS:'0',GIT_NO_LAZY_FETCH:'1'},encoding:'utf8'});
+              const origin=run(['config','--no-includes','--local','--get','remote.origin.url']).trim();
+              if (!['https://github.com/'+repository,'https://github.com/'+repository+'.git','git@github.com:'+repository+'.git'].includes(origin)) throw new Error('Foreign origin');
+              if (run(['rev-parse','--show-toplevel']).trim()!==sourceRoot) throw new Error('Foreign worktree root');
+              const file=(p)=> {
+                const before=fs.lstatSync(p,{bigint:true});
+                if (before.isSymbolicLink()) {
+                  const original=principal(p),target=fs.readlinkSync(p,{encoding:'buffer'}).toString('hex');
+                  if(!same(principal(p),original)) throw new Error('Source symlink changed');
+                  return {principal:original,target};
+                }
+                if (!before.isFile()) throw new Error('Non-regular source');
+                const fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+                try {
+                  const opened=fs.fstatSync(fd,{bigint:true});
+                  if (opened.dev!==before.dev||opened.ino!==before.ino) throw new Error('Source replaced');
+                  const bytes=fs.readFileSync(fd), after=fs.fstatSync(fd,{bigint:true});
+                  if (after.size!==opened.size||after.mtimeNs!==opened.mtimeNs||!same(principal(p),principalFromStat(opened))) throw new Error('Source changed');
+                  return {principal:principal(p),sha256:crypto.createHash('sha256').update(bytes).digest('hex')};
+                } finally {fs.closeSync(fd);}
+              };
+              const principalFromStat=s=>({dev:s.dev.toString(),ino:s.ino.toString(),uid:s.uid.toString(),gid:s.gid.toString(),mode:s.mode.toString()});
+              const identity=()=> {
+                const entries=run(['ls-files','--stage','-z']).split('\0').filter(Boolean), tracked={};
+                for(const row of entries) {
+                  if(row.startsWith('160000 ')) throw new Error('Unsupported gitlink');
+                  const name=row.slice(row.indexOf('\t')+1);
+                  if (!name || path.isAbsolute(name) || name.split('/').includes('..')) throw new Error('Invalid source member');
+                  tracked[name]=file(path.join(sourceRoot,name));
+                }
+                return {root:directory(workspace),sourceRoot:directory(sourceRoot),git:directory(gitdir),head:run(['rev-parse','--verify','HEAD']).trim(),entries,config:file(path.join(gitdir,'config')),index:file(path.join(gitdir,'index')),tracked};
+              };
+              for(const p of [path.join(gitdir,'config'),path.join(gitdir,'index')]) if(!fs.lstatSync(p).isFile()||fs.lstatSync(p).isSymbolicLink()) throw new Error('Git metadata kind');
+              const before=identity();
+              if(!/^[0-9a-f]{40}$/.test(before.head)) throw new Error('Invalid source HEAD');
+              if (!same(directory(parent),pp)||!same(directory(workspace),wp)||!same(directory(temporary),tp)) throw new Error('Directory authority changed');
+              assertHeld();
+              const held=fs.mkdtempSync(path.join(parent,'.acp-preserved-checkout-'));
+              const hp=directory(held);
+              if ((BigInt(hp.mode)&0o777n)!==0o700n || hp.dev!==wp.dev) throw new Error('Nonexclusive or cross-device preservation');
+              const destination=path.join(held,'workspace');
+              if(exists(destination)) throw new Error('Occupied preservation destination');
+              if(!same(identity(),before)||!same(directory(parent),pp)||!same(directory(held),hp)) throw new Error('Pre-rename authority drift');
+              assertHeld();
+              fs.renameSync(workspace,destination);
+              for(const h of heldDirectories)if(h.path===workspace||h.path.startsWith(workspace+path.sep))h.path=destination+h.path.slice(workspace.length);
+              if(!same(directory(destination),wp)) throw new Error('Preserved root identity drift');
+              try {fs.mkdirSync(workspace,{mode:Number(BigInt(wp.mode)&0o777n)});}
+              catch(error) {
+                if(exists(workspace)) throw new Error('Occupied rollback destination; preserved checkout retained');
+                if(!same(directory(destination),wp)||!same(directory(parent),pp)) throw new Error('Rollback authority drift');
+                fs.renameSync(destination,workspace); throw new Error('Root creation failed; original checkout restored');
+              }
+              assertHeld();directory(workspace);
+              core.info('Fresh owning root created; exact previous checkout retained at '+JSON.stringify(destination));
+              } finally {for(const h of heldDirectories)fs.closeSync(h.fd);}
+            };
+
+            await freshOwnedRoot({ core, io, workspace:process.env.GITHUB_WORKSPACE, temporary:process.env.RUNNER_TEMP, repository:process.env.GITHUB_REPOSITORY });
+
       - uses: actions/checkout@v4
+        with:
+          path: nim-acp
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          nix-github-token: ${{ github.token }}
+          substituter-preflight: fail
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - run: nix build .#default 2>&1 | tee nix-build.log
         shell: bash
+      - name: Observe Linux kernel limits before the owning phase
+        id: linux_resources_before
+        if: runner.os == 'Linux'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'before',temporary:process.env.RUNNER_TEMP,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Authenticate exact native managed-hook cache producer
+        id: managed_cache
+        shell: bash
+        env:
+          ACP_ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
+          ACP_ATTIC_ENDPOINT: ${{ vars.ATTIC_ENDPOINT }}
+          ACP_ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ACP_ATTIC_PUBLIC_KEY: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+        run: bash ci/prepare-managed-cache-producer.sh
+      - name: Verify the selected finite cache-client role
+        shell: bash
+        env:
+          ACP_EXPECTED_ATTIC: ${{ steps.managed_cache.outputs.attic_executable }}
+          ACP_RECEIPT_PYTHON: ${{ steps.managed_cache.outputs.python_executable }}
+          ACP_CACHE_RECEIPT: ${{ steps.managed_cache.outputs.receipt_path }}
+        run: |
+          set -euo pipefail
+          selected="$(command -v attic)"
+          test "$selected" = "$ACP_EXPECTED_ATTIC"
+          "$ACP_RECEIPT_PYTHON" -c 'import hashlib,json,sys; from pathlib import Path; p=Path(sys.argv[1]); r=Path(sys.argv[2]); expected=json.loads((r/"identity.json").read_text())["atticExecutableSHA256"]; actual=hashlib.sha256(p.read_bytes()).hexdigest(); assert actual==expected; (r/"selected-client.json").write_text(json.dumps({"selectedExecutable":str(p),"SHA256":actual}))' "$selected" "$ACP_CACHE_RECEIPT"
+      - name: Publish exact managed-hook constructor through the supported finite cache action
+        uses: metacraft-labs/devops-modules/modules/attic-push-flake-outputs@d54ea9d8bc557f92d79382b97460c82e637ce667
+        env:
+          XDG_CONFIG_HOME: ${{ steps.managed_cache.outputs.config_directory }}
+        with:
+          endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          cache: ${{ vars.ATTIC_CACHE }}
+          token: ${{ secrets.ATTIC_TOKEN }}
+          flake: ./nim-acp
+          attributes: managed-hook-constructor
+          extra-nix-args: --no-update-lock-file
+      - name: Observe Linux kernel limits after the owning phase
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+          ACP_KERNEL_RECEIPT: ${{ steps.linux_resources_before.outputs.receipt_path }}
+          ACP_KERNEL_DIRECTORY_IDENTITY: ${{ steps.linux_resources_before.outputs.directory_identity }}
+          ACP_KERNEL_BEFORE_SHA256: ${{ steps.linux_resources_before.outputs.snapshot_sha256 }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'after',temporary:process.env.RUNNER_TEMP,receipt:process.env.ACP_KERNEL_RECEIPT,directoryIdentity:process.env.ACP_KERNEL_DIRECTORY_IDENTITY,beforeSHA:process.env.ACP_KERNEL_BEFORE_SHA256,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Retain bounded public Linux kernel observations
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-linux-kernel-${{ github.job }}-${{ runner.arch }}
+          path: |
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
+          if-no-files-found: warn
+      - name: Retain public managed-hook producer identities
+        if: always() && steps.managed_cache.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-managed-hook-cache-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            ${{ steps.managed_cache.outputs.receipt_path }}/identity.json
+            ${{ steps.managed_cache.outputs.receipt_path }}/selected-client.json
+            ${{ steps.managed_cache.outputs.receipt_path }}/package-raw.json
+            ${{ steps.managed_cache.outputs.receipt_path }}/closure.json
+            ${{ steps.managed_cache.outputs.receipt_path }}/nix-system.txt
+            ${{ steps.managed_cache.outputs.receipt_path }}/repro-version.txt
+          include-hidden-files: true
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: nix-build-log-${{ join(matrix.runner, '-') }}
-          path: nix-build.log
+          path: nim-acp/nix-build.log
