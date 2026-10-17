@@ -37,7 +37,7 @@ function Identity($handle, [string]$expected, [bool]$directory) {
   return [ordered]@{path=$canonical; volume=$info.Volume; indexHigh=$info.IndexHigh; indexLow=$info.IndexLow; attributes=$info.Attributes; links=$info.Links; sizeHigh=$info.SizeHigh; sizeLow=$info.SizeLow; writeHigh=$info.Write.dwHighDateTime; writeLow=$info.Write.dwLowDateTime}
 }
 function Hold-Directory([string]$path) {
-  $handle = [AcpNativeFixtureIdentity]::CreateFileW($path,0x80000000,1,[IntPtr]::Zero,3,0x02200000,[IntPtr]::Zero)
+  $handle = [AcpNativeFixtureIdentity]::CreateFileW($path,[uint32]2147483648,1,[IntPtr]::Zero,3,0x02200000,[IntPtr]::Zero)
   if ($handle.IsInvalid) { $handle.Dispose(); throw 'Could not hold declared managed directory' }
   $holds.Add($handle)
   return Identity $handle $path $true
