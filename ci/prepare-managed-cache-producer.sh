@@ -41,16 +41,18 @@ public_drv="$(nix eval --raw --no-write-lock-file 'github:metacraft-labs/reprobu
 nix derivation show "$public_drv" > "$receipt/derivation-raw.json"
 nix path-info --json --recursive "$package" > "$receipt/closure.json"
 nix eval --impure --raw --expr builtins.currentSystem > "$receipt/nix-system.txt"
-"$python" - "$receipt" "$package" "$public_drv" "$python_output" "$attic_output" "$action_tools_output" <<'PY'
+"$python" -B - "$receipt" "$package" "$public_drv" "$python_output" "$attic_output" "$action_tools_output" <<'PY'
 import hashlib,json,os,platform,sys
 from pathlib import Path
+sys.path.insert(0, str(Path("ci").resolve()))
+from nix_derivation import read_derivation
 receipt,package,public_drv,python_output,attic_output,action_tools_output=sys.argv[1:];receipt=Path(receipt);package=Path(package)
 lock=json.loads(Path('flake.lock').read_text());node=lock['nodes'][lock['nodes'][lock['root']]['inputs']['managed-hook-reprobuild']]['locked']
 assert node['owner']=='metacraft-labs' and node['repo']=='reprobuild' and node['rev']=='064daf5b154ea6a0758ddb2dcbcbc07685216e44'
 built=json.loads((receipt/'package-raw.json').read_text());assert len(built)==1 and built[0]['drvPath']==public_drv and built[0]['outputs']['out']==str(package)
-derivations=json.loads((receipt/'derivation-raw.json').read_text());assert len(derivations)==1;derivation=next(iter(derivations.values()))
 machine=platform.machine();arch={'aarch64':'aarch64','arm64':'aarch64','x86_64':'x86_64'}.get(machine);assert arch,machine
 system=arch+{'linux':'-linux','darwin':'-darwin'}[sys.platform]
+derivation=read_derivation(receipt/'derivation-raw.json',public_drv,str(package),system)
 assert (receipt/'nix-system.txt').read_text().strip()==system and derivation['system']==system
 closure=json.loads((receipt/'closure.json').read_text());assert isinstance(closure,(list,dict)) and closure
 closure_rows=closure if isinstance(closure,list) else [dict(v,path=k) for k,v in closure.items()]
@@ -70,16 +72,13 @@ action_tools=Path(action_tools_output);tool_images={}
 action_closure=json.loads((receipt/'action-tools-closure.json').read_text())
 action_rows=action_closure if isinstance(action_closure,list) else [dict(v,path=k) for k,v in action_closure.items()]
 assert any(row['path']==str(action_tools) for row in action_rows)
-action_drv=json.loads((receipt/'action-tools-derivation.json').read_text());assert len(action_drv)==1
 declared_action_drv=(receipt/'action-tools-declared-drv.txt').read_text().strip()
 assert declared_action_drv.startswith('/nix/store/') and declared_action_drv.endswith('.drv')
-assert set(action_drv) in ({declared_action_drv},{Path(declared_action_drv).name})
 action_build=json.loads((receipt/'action-tools-build.json').read_text());assert len(action_build)==1
 assert action_build[0]['drvPath']==declared_action_drv and action_build[0]['outputs']['out']==str(action_tools)
 observed_action_deriver=(receipt/'action-tools-observed-deriver.txt').read_text().strip()
 assert observed_action_deriver in ('unknown-deriver',declared_action_drv), 'Contradictory action-tools deriver metadata'
-action_derivation=next(iter(action_drv.values()))
-assert action_derivation['system']==system and action_derivation['outputs']['out']['path']==str(action_tools)
+action_derivation=read_derivation(receipt/'action-tools-derivation.json',declared_action_drv,str(action_tools),system)
 for name in ('sed','sort','mktemp','rm','sleep'):
   executable=action_tools/'bin'/name;resolved=executable.resolve(strict=True)
   assert executable.is_file() and os.access(executable,os.X_OK) and str(resolved).startswith('/nix/store/')

@@ -244,22 +244,22 @@ jobs:
           "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); assert open(sys.argv[2]).read().strip()==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/source-realized-nar-hash.txt"
           sha256sum "$source_root/flake.nix" "$source_root/flake.lock" "$package/bin/repro" "$package/bin/.repro-wrapped" "$package/bin/.reprobuild-wrapped" "$package/libexec/reprobuild-nix-daemon" | tee "$receipt/identities.sha256"
 
+          runtime_system="$("$receipt_python" -c 'import platform,sys; assert sys.platform=="linux"; machine=platform.machine(); assert machine in ("x86_64","aarch64","arm64"); print({"x86_64":"x86_64-linux","aarch64":"aarch64-linux","arm64":"aarch64-linux"}[machine])')"
           package_drv="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["drvPath"])' "$package_json")"
           nix derivation show "$package_drv" > "$receipt/package-derivation-raw.json"
-          drv_source="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; d=next(iter(x.values())); from pathlib import PurePosixPath; out=d["outputs"]["out"]["path"]; assert out in (sys.argv[2],PurePosixPath(sys.argv[2]).name); print(d["env"]["src"])' "$receipt/package-derivation-raw.json" "$package")"
+          drv_source="$("$receipt_python" ci/nix_derivation.py "$receipt/package-derivation-raw.json" "$package_drv" "$package" "$runtime_system")"
           nix hash path --type sha256 --sri "$drv_source" > "$receipt/package-derivation-source-nar-hash.txt"
           "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); actual=open(sys.argv[2]).read().strip(); assert actual==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/package-derivation-source-nar-hash.txt"
 
           # The standalone CLI package does not carry the RunQuota daemon.
           # Select its public package through this exact SDK's locked input, so
           # the SDK's follows graph and source revision govern the daemon too.
-          runtime_system="$("$receipt_python" -c 'import platform,sys; assert sys.platform=="linux"; machine=platform.machine(); assert machine in ("x86_64","aarch64","arm64"); print({"x86_64":"x86_64-linux","aarch64":"aarch64-linux","arm64":"aarch64-linux"}[machine])')"
           runquota_expr="(builtins.getFlake \"github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d\").inputs.runquota-src.packages.$runtime_system.default"
           nix build --no-link --json --no-update-lock-file --expr "$runquota_expr" > "$receipt/runquota-package-raw.json"
           runquota_package="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["outputs"]["out"])' "$receipt/runquota-package-raw.json")"
           runquota_drv="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["drvPath"])' "$receipt/runquota-package-raw.json")"
           nix derivation show "$runquota_drv" > "$receipt/runquota-derivation-raw.json"
-          runquota_drv_source="$("$receipt_python" -c 'import json,sys; from pathlib import PurePosixPath; x=json.load(open(sys.argv[1])); assert len(x)==1; d=next(iter(x.values())); assert d["system"]==sys.argv[3]; assert d["outputs"]["out"]["path"] in (sys.argv[2],PurePosixPath(sys.argv[2]).name); print(d["env"]["src"])' "$receipt/runquota-derivation-raw.json" "$runquota_package" "$runtime_system")"
+          runquota_drv_source="$("$receipt_python" ci/nix_derivation.py "$receipt/runquota-derivation-raw.json" "$runquota_drv" "$runquota_package" "$runtime_system")"
           nix hash path --type sha256 --sri "$runquota_drv_source" > "$receipt/runquota-derivation-source-nar-hash.txt"
           nix path-info --json --recursive "$runquota_package" > "$receipt/runquota-closure.json"
           "$receipt_python" - "$source_root" "$receipt" "$runquota_package" "$runquota_drv" "$runtime_system" <<'PY_RUNQUOTA'
