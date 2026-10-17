@@ -343,6 +343,14 @@ jobs:
           path: nim-acp/native-windows-fixture-tools.json
           if-no-files-found: warn
 
+      - name: Admit the declared native Windows Just task runner
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          & ./ci/admit-native-windows-just-tool.ps1 | Tee-Object -FilePath native-windows-just-tool.json
+          exit $LASTEXITCODE
+
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the
@@ -421,6 +429,7 @@ jobs:
             .repro/build/repro/path-only-tool-identities.inspect.json
             repro-admission-diagnostic.log
             windows-fixture-tools-diagnostic.json
+            native-windows-just-tool.json
             windows-nim-runtime-diagnostic.json
           include-hidden-files: true
           retention-days: 7
