@@ -5,6 +5,8 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 output=$(mktemp -d "${TMPDIR:-/tmp}/acp-native-group-controls.XXXXXXXX")
 trap 'rm -rf -- "$output"' EXIT
+output=$(cd -- "$output" && pwd -P)
+export ACP_GROUP_CONTROL_TEMP_PARENT="$output"
 cc -std=c11 -Wall -Wextra -pthread -Isrc/nim_acp tests/native/owned_posix_group_outcome_control.c -o "$output/control"
 status=0
 "$output/control" unknown-mode || status=$?

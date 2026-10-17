@@ -101,7 +101,7 @@ int main(int argc,char **argv) {
   snprintf(parent_release_arg,sizeof parent_release_arg,"%d",release[1]);
   snprintf(parent_evidence_arg,sizeof parent_evidence_arg,"%d",evidence[0]);
   char *child_argv[]={argv[0],"--child",(char*)mode,release_arg,evidence_arg,parent_release_arg,parent_evidence_arg,NULL};
-  acp_owned_posix_child *c=NULL;int spawn=acp_owned_spawn(argv[0],child_argv,NULL,NULL,&c);
+  acp_owned_posix_child *c=NULL;int spawn=acp_owned_spawn(argv[0],child_argv,NULL,getenv("ACP_GROUP_CONTROL_TEMP_PARENT"),&c);
   fixture_owned=c;
   close(release[0]);close(evidence[1]);int failed=spawn!=0 || c==NULL;int first=-1,second=-1;char observed=0;
   if(!failed && strcmp(mode,"exit"))failed=!read_byte_until(evidence[0],&observed,millis()+3000)||observed!='R';
