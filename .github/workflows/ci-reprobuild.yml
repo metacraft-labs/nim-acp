@@ -328,6 +328,21 @@ jobs:
           repro --version
           exit $LASTEXITCODE
 
+      - name: Admit declared native Windows x64 fixture tools
+        if: runner.os == 'Windows' && matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          & ./ci/admit-native-windows-x64-fixture-tools.ps1 | Tee-Object -FilePath native-windows-fixture-tools.json
+          exit $LASTEXITCODE
+
+      - name: Retain declared Windows fixture tool admission
+        if: always() && runner.os == 'Windows' && matrix.arch == 'x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-x64-fixture-tools
+          path: nim-acp/native-windows-fixture-tools.json
+          if-no-files-found: warn
+
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the

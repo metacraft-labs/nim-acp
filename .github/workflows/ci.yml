@@ -204,6 +204,17 @@ jobs:
             ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
             ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
           if-no-files-found: warn
+      - name: Qualify native owned process group outcomes
+        if: ${{ always() && (steps.original_tests.outcome == 'success' || steps.original_tests.outcome == 'failure') }}
+        run: nix develop --command bash tools/test-owned-posix-group-outcomes.sh 2>&1 | tee native-group-controls.log
+        shell: bash
+      - name: Retain native process group control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-group-controls-${{ join(matrix.runner, '-') }}
+          path: nim-acp/native-group-controls.log
+          if-no-files-found: warn
       - name: Observe native Darwin admission after original test failure
         if: ${{ failure() && runner.os == 'macOS' && steps.original_tests.outcome == 'failure' }}
         run: nix develop --command nim c -r -d:acpAdmissionDiagnostics --nimcache:.nimcache/tests/acp-admission-diagnostic --out:build/test_send_with_stream_admission_diagnostic --path:src tests/test_send_with_stream.nim 2>&1 | tee admission-diagnostic.log

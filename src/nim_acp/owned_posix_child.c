@@ -46,6 +46,7 @@ struct acp_admission_diagnostic {
   long child_pid, wait_pid, session_result, group_result;
   int session_errno, group_errno;
   int close_attempted, close_stage, close_error, close_signal;
+  int close_signal_result, close_signal_errno, close_signal_outcome;
   int leader_attempted, leader_wait_result, leader_wait_errno, leader_wait_code;
   long leader_wait_pid, close_child_pid, close_session_result, close_group_result;
   int close_session_attempted, close_session_errno;
@@ -70,6 +71,7 @@ const char *acp_admission_snapshot_json(void) {
     "\"waitResult\":%d,\"waitErrno\":%d,\"waitCode\":%d,\"waitStatus\":%d,\"childPID\":%ld,\"waitPID\":%ld,"
     "\"sessionResult\":%ld,\"groupResult\":%ld,\"sessionErrno\":%d,\"groupErrno\":%d,"
     "\"closeChildPID\":%ld,\"closeAttempted\":%d,\"closeStage\":%d,\"closeError\":%d,\"closeSignal\":%d,"
+    "\"closeSignalResult\":%d,\"closeSignalErrno\":%d,\"closeSignalOutcome\":%d,"
     "\"leaderAttempted\":%d,\"leaderWaitResult\":%d,\"leaderWaitErrno\":%d,\"leaderWaitCode\":%d,\"leaderWaitPID\":%ld,"
     "\"closeSessionAttempted\":%d,\"closeSessionResult\":%ld,\"closeSessionErrno\":%d,"
     "\"closeGroupAttempted\":%d,\"closeGroupResult\":%ld,\"closeGroupErrno\":%d,\"sessionAcknowledged\":%d}",
@@ -82,6 +84,7 @@ const char *acp_admission_snapshot_json(void) {
     d->wait_result,d->wait_errno,d->wait_code,d->wait_status,d->child_pid,d->wait_pid,
     d->session_result,d->group_result,d->session_errno,d->group_errno,
     d->close_child_pid,d->close_attempted,d->close_stage,d->close_error,d->close_signal,
+    d->close_signal_result,d->close_signal_errno,d->close_signal_outcome,
     d->leader_attempted,d->leader_wait_result,d->leader_wait_errno,d->leader_wait_code,d->leader_wait_pid,
     d->close_session_attempted,d->close_session_result,d->close_session_errno,
     d->close_group_attempted,d->close_group_result,d->close_group_errno,d->session_acknowledged);
@@ -492,7 +495,15 @@ int acp_owned_drained(acp_owned_posix_child *c) {
   return e?-e:drained;
 }
 
-static int signal_owned_group(acp_owned_posix_child *c, int signal_number) {
+enum acp_group_signal_outcome {
+  ACP_GROUP_SIGNAL_UNATTEMPTED=0,
+  ACP_GROUP_SIGNAL_DELIVERED,
+  ACP_GROUP_SIGNAL_ABSENT,
+  ACP_GROUP_SIGNAL_DEFERRED_TERMINAL_PERMISSION
+};
+static int signal_owned_group(acp_owned_posix_child *c, int signal_number,
+                              enum acp_group_signal_outcome *outcome) {
+  *outcome=ACP_GROUP_SIGNAL_UNATTEMPTED;
   int alive=leader_alive(c);
   if (alive < 0) return -alive;
   if (!c->session_established) return ECHILD;
@@ -520,7 +531,29 @@ static int signal_owned_group(acp_owned_posix_child *c, int signal_number) {
    * session/group number through the signal. A session leader cannot change
    * groups. The caller's existing sole-waiter contract remains mandatory. */
   alive=leader_alive(c);if(alive<0)return -alive;
-  if (kill(-c->pid, signal_number) < 0 && errno != ESRCH) return errno;
+  int sent=kill(-c->pid,signal_number), signal_error=sent<0?errno:0;
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_diagnostic.close_signal_result=sent;
+  admission_diagnostic.close_signal_errno=signal_error;
+#endif
+  if(sent==0)*outcome=ACP_GROUP_SIGNAL_DELIVERED;
+  else if(signal_error==ESRCH)*outcome=ACP_GROUP_SIGNAL_ABSENT;
+#ifdef __APPLE__
+  else if(signal_error==EPERM && alive==0) {
+    /* XNU filters zombies from group signalling, so EPERM alone cannot
+     * distinguish a zombie-only group from denied live members. Do not claim
+     * delivery. Keep the exact unreaped session leader and continue shutdown;
+     * only the unchanged final POSIX group probe may prove complete drain. */
+    int terminal=leader_alive(c);
+    if(terminal<0)return -terminal;
+    if(terminal!=0)return signal_error;
+    *outcome=ACP_GROUP_SIGNAL_DEFERRED_TERMINAL_PERMISSION;
+  }
+#endif
+  else return signal_error;
+#ifdef ACP_ADMISSION_DIAGNOSTICS
+  admission_diagnostic.close_signal_outcome=(int)*outcome;
+#endif
   return 0;
 }
 static int publish_drained(acp_owned_posix_child *c) {
@@ -530,6 +563,7 @@ static int publish_drained(acp_owned_posix_child *c) {
 static int close_quiet(acp_owned_posix_child *c, int graceful_ms, int terminal_ms) {
   long long start=millis(), end;
   int alive, e, status;
+  enum acp_group_signal_outcome signal_outcome;
   if (!c) return 0;
   if (c->drained) return 0;
   if (start < 0) return errno;
@@ -560,7 +594,7 @@ static int close_quiet(acp_owned_posix_child *c, int graceful_ms, int terminal_m
 #ifdef ACP_ADMISSION_DIAGNOSTICS
   admission_diagnostic.close_stage=2;
 #endif
-  if ((e=signal_owned_group(c,SIGTERM))) return e;
+  if ((e=signal_owned_group(c,SIGTERM,&signal_outcome))) return e;
   start=millis();if(start < 0)return errno;end=start+terminal_ms;
   /* Preserve a real TERM grace period even if the direct leader has already
    * exited. Its surviving group members still receive time to handle TERM. */
@@ -574,7 +608,7 @@ static int close_quiet(acp_owned_posix_child *c, int graceful_ms, int terminal_m
 #ifdef ACP_ADMISSION_DIAGNOSTICS
   admission_diagnostic.close_stage=3;
 #endif
-  if ((e=signal_owned_group(c,SIGKILL))) return e;
+  if ((e=signal_owned_group(c,SIGKILL,&signal_outcome))) return e;
   alive=wait_alive_until(c,end);
   if (alive < 0) return -alive;
   if (alive) return ETIMEDOUT;
@@ -598,6 +632,9 @@ int acp_owned_close(acp_owned_posix_child *c,int graceful_ms,int terminal_ms) {
   admission_diagnostic.close_attempted=1;
   admission_diagnostic.close_stage=0;admission_diagnostic.close_error=-2;
   admission_diagnostic.close_signal=-2;
+  admission_diagnostic.close_signal_result=-2;
+  admission_diagnostic.close_signal_errno=0;
+  admission_diagnostic.close_signal_outcome=0;
   admission_diagnostic.leader_attempted=0;admission_diagnostic.leader_wait_result=-2;
   admission_diagnostic.leader_wait_errno=0;admission_diagnostic.leader_wait_code=0;
   admission_diagnostic.leader_wait_pid=0;
