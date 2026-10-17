@@ -375,6 +375,12 @@ jobs:
           & ./ci/observe-cached-native-x64-git-tools.ps1 | Tee-Object -FilePath windows-fixture-tools-diagnostic.json
           exit $LASTEXITCODE
 
+      - name: Retain selected Windows x64 installed Nim source after original failure
+        if: ${{ failure() && runner.os == 'Windows' && matrix.arch == 'x64' }}
+        shell: pwsh
+        run: |
+          & ./ci/observe-selected-windows-nim-runtime.ps1 | Tee-Object -FilePath windows-nim-runtime-diagnostic.json
+
       # Diagnostics on failure. Three things below are load-bearing:
       #
       # 1. `include-hidden-files: true`. actions/upload-artifact@v4 defaults this
@@ -415,6 +421,7 @@ jobs:
             .repro/build/repro/path-only-tool-identities.inspect.json
             repro-admission-diagnostic.log
             windows-fixture-tools-diagnostic.json
+            windows-nim-runtime-diagnostic.json
           include-hidden-files: true
           retention-days: 7
           if-no-files-found: warn
