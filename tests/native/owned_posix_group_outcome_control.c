@@ -2,6 +2,9 @@
  * Only TERM/KILL denial is injected in the named sensitivity control;
  * every group-0 probe and final absence observation is an actual syscall. */
 #define _GNU_SOURCE 1
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
 #define _POSIX_C_SOURCE 200809L
 #include <signal.h>
 #include <errno.h>
