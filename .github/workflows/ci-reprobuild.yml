@@ -219,7 +219,7 @@ jobs:
           test -x "$receipt_python_out/bin/python3"
           receipt_python="$receipt_python_out/bin/python3"
           package_json="$receipt/package-raw.json"
-          nix build --no-link --json --no-update-lock-file 'github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d#reprobuild'  > "$package_json"
+          "$receipt_python" ci/observe_linux_runtime_build.py --receipt-directory "$receipt" -- nix build --no-link --json --no-update-lock-file 'github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d#reprobuild' > "$package_json"
           package="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["outputs"]["out"])' "$package_json")"
           # A self-hosted runner may retain receipts from earlier jobs. Allocate
           # exclusively and export this job's path without touching prior evidence.
