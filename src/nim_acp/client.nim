@@ -3,7 +3,8 @@ import std/tables
 import nim_acp/[jsonrpc, types]
 
 when not defined(js):
-  import std/[atomics, locks, options, os, osproc, streams, strutils, times]
+  import std/[atomics, locks, options, os, osproc, streams, strutils, times,
+    typetraits]
   when defined(posix):
     import std/posix
 
@@ -12,6 +13,9 @@ type
     ## A user message that was queued (via :proc:`injectUserMessage`)
     ## while a turn was already in flight, or between turns.  Drained
     ## at the next turn boundary by :proc:`takeQueuedInjections`.
+    ## On native builds the queue never stores this type: it keeps a
+    ## byte copy in shared memory, and take and peek build each
+    ## ``PendingInjection`` on the calling thread's heap.
     text*: string
     receivedAt*: float       # epochTime() when injected (native);
                              # 0.0 on JS where epochTime is unavailable
@@ -26,26 +30,64 @@ when defined(js):
       ## step exists that could race.
       pending: Table[string, seq[PendingInjection]]
 else:
+  # Every byte the native queue holds lives in manually managed shared
+  # memory (``allocShared``), and nothing in it is GC-managed: no
+  # ``string``, ``seq``, ``Table`` or ``ref``.  Text crosses into and out
+  # of the queue only as a byte copy, made on the calling thread.  This
+  # is what makes the queue sound under every memory manager its
+  # consumers build with:
+  #
+  # * Under ``--mm:refc`` every thread owns a private heap.  A buffer
+  #   allocated on one thread's heap may not be freed, resized or even
+  #   read on another, and the owning thread's heap pages are unmapped
+  #   when it exits (``deallocOsPages`` in ``threadProcWrapStackFrame``,
+  #   ``lib/system/threadimpl.nim``).  The previous queue kept a
+  #   ``Table[string, seq[PendingInjection]]`` here, whose buckets, keys
+  #   and strings sat on whichever thread's heap allocated them; under
+  #   refc it hung ``test_concurrent_inject_take_thread_safe`` and
+  #   crashed ``test_injections_outlive_the_producer_thread``.
+  #   CodeTracer's ``ct`` binary builds ``--mm:refc`` and links this
+  #   module.
+  # * Under ``--mm:orc`` the heap is shared, but reference counts are
+  #   not atomic, so the same rule keeps ``ref`` out of shared memory.
+  #
+  # Sessions are a singly linked list rather than a hash table: a
+  # transport carries a handful of live sessions at a time, and a
+  # drained session is unlinked, so a linear scan stays short.
   type
+    SharedInjection = object
+      ## One queued entry.  Allocated as a single block of
+      ## ``sizeof(SharedInjection) + len`` bytes; ``text`` is the
+      ## ``len`` bytes of the injected string, with no terminator.
+      next: ptr SharedInjection
+      receivedAt: float
+      len: int
+      text: UncheckedArray[char]
+    SharedSession = object
+      ## The FIFO of one session id, from ``head`` (oldest) to ``tail``.
+      ## Allocated as one block like :type:`SharedInjection`, with the
+      ## session id's ``idLen`` bytes in ``id``.  A session exists only
+      ## while it has at least one entry.
+      next: ptr SharedSession
+      head, tail: ptr SharedInjection
+      idLen: int
+      id: UncheckedArray[char]
     InjectionQueueState = object
       ## The shared part of an :type:`InjectionQueue`.  It lives in
-      ## manually managed shared memory (``createShared``), NOT behind
-      ## an ORC ``ref``: ORC reference counts are not atomic, so a
+      ## shared memory (``createShared``), NOT behind a ``ref``: a
       ## ``ref`` that two threads copy and destroy concurrently loses
-      ## count updates and is freed while still in use.  That is exactly
-      ## how the earlier ``ref``-based queue crashed under
-      ## ``test_concurrent_inject_take_thread_safe``.  A ``ptr`` has no
-      ## reference count, so reaching the queue from any number of
-      ## threads touches no shared counter.
+      ## count updates under ORC and is freed while still in use, which
+      ## is exactly how the earlier ``ref``-based queue crashed under
+      ## ``test_concurrent_inject_take_thread_safe``; under refc it would
+      ## also belong to one thread's heap.  A ``ptr`` has no reference
+      ## count, so reaching the queue from any number of threads touches
+      ## no shared counter.
       lock: Lock
-      pending {.guard: lock.}: Table[string, seq[PendingInjection]]
-        ## Values are moved in and out under ``lock``.  This is safe
-        ## across threads only because ``PendingInjection`` holds no
-        ## ``ref``: under ORC a string or seq is not reference counted,
-        ## so the copy or move that crosses the lock owns its buffer
-        ## outright.  Adding a ``ref`` field to ``PendingInjection``
-        ## would reintroduce a cross-thread refcount and requires
-        ## ``isolate``-style hand-off instead.
+      sessions {.guard: lock.}: ptr SharedSession
+        ## Every session with queued entries.  Nodes are linked and
+        ## unlinked only under ``lock``; their bytes are written before
+        ## they are linked and read or freed only after they are
+        ## unlinked (or, by peek, under ``lock``).
     InjectionQueue = object
       ## Owner of one transport's :type:`InjectionQueueState`.  The
       ## state is created on first injection and published with a
@@ -54,6 +96,53 @@ else:
       ## owning transport is destroyed.  Not copyable: two owners would
       ## free the state twice.
       state: Atomic[ptr InjectionQueueState]
+
+  # Shared memory must never hold a GC-managed value; see above.  These
+  # fail to compile if someone adds a ``string``, ``seq`` or ``ref``
+  # field to one of the shared records.
+  static:
+    doAssert supportsCopyMem(SharedInjection)
+    doAssert supportsCopyMem(SharedSession)
+    doAssert supportsCopyMem(InjectionQueueState)
+
+  proc newSharedInjection(text: string;
+      receivedAt: float): ptr SharedInjection =
+    ## Copy ``text`` into a fresh, unlinked shared entry.
+    result = cast[ptr SharedInjection](
+      allocShared(sizeof(SharedInjection) + text.len))
+    result.next = nil
+    result.receivedAt = receivedAt
+    result.len = text.len
+    if text.len > 0:
+      copyMem(addr result.text[0], unsafeAddr text[0], text.len)
+
+  proc newSharedSession(sessionId: string): ptr SharedSession =
+    ## Copy ``sessionId`` into a fresh, empty, unlinked shared session.
+    result = cast[ptr SharedSession](
+      allocShared0(sizeof(SharedSession) + sessionId.len))
+    result.idLen = sessionId.len
+    if sessionId.len > 0:
+      copyMem(addr result.id[0], unsafeAddr sessionId[0], sessionId.len)
+
+  proc hasId(session: ptr SharedSession; sessionId: string): bool =
+    session.idLen == sessionId.len and (sessionId.len == 0 or
+      equalMem(addr session.id[0], unsafeAddr sessionId[0], sessionId.len))
+
+  proc toPendingInjection(entry: ptr SharedInjection): PendingInjection =
+    ## Copy ``entry`` onto the calling thread's heap.
+    result.receivedAt = entry.receivedAt
+    result.text = newString(entry.len)
+    if entry.len > 0:
+      copyMem(addr result.text[0], addr entry.text[0], entry.len)
+
+  proc freeSession(session: ptr SharedSession) =
+    ## Free an unlinked session and every entry still in it.
+    var entry = session.head
+    while entry != nil:
+      let next = entry.next
+      deallocShared(entry)
+      entry = next
+    deallocShared(session)
 
   # The destroy body is shared across both `=destroy` signatures below.
   # The by-value `proc =destroy(x: T)` is accepted only under the destructor
@@ -66,6 +155,13 @@ else:
   # without losing the move/sink-friendly by-value form where it is accepted.
   # This mirrors the same split in codetracer-trace-format-nim's
   # `member_view.nim` (`destroyContainerImageObj`).
+  #
+  # Under refc the hook still runs: the compiler gives a ``ref`` type
+  # whose fields have destructors a finalizer that calls them, so the
+  # owning thread's collector frees the shared state when it collects
+  # the transport.  refc runs no collection when a thread or the
+  # program exits, so a transport still reachable then keeps its state
+  # until the process ends.
   template destroyInjectionQueue(queue: untyped) =
     ## Runs when the owning transport is destroyed.  By then no other
     ## thread may still be calling the queue methods on that transport:
@@ -73,9 +169,14 @@ else:
     ## which is the caller's lifetime to manage.
     let state = queue.state.addr[].load(moAcquire)
     if state != nil:
+      var sessions: ptr SharedSession = nil
       withLock state.lock:
-        # Frees every key, seq and string the table still owns.
-        reset(state.pending)
+        sessions = state.sessions
+        state.sessions = nil
+      while sessions != nil:
+        let next = sessions.next
+        freeSession(sessions)
+        sessions = next
       deinitLock(state.lock)
       deallocShared(state)
 
@@ -292,7 +393,7 @@ else:
     ## The published queue state, or ``nil`` if nothing was ever injected.
     ## The acquire load pairs with the release half of the publishing
     ## compare-and-swap in :proc:`queueState`, so a non-nil result points
-    ## at a fully initialised lock and table.
+    ## at a fully initialised lock and session list.
     transport.injectionQueue.state.load(moAcquire)
 
   proc queueState(transport: AcpTransport): ptr InjectionQueueState =
@@ -303,7 +404,7 @@ else:
     result = existingQueueState(transport)
     if result == nil:
       let candidate = createShared(InjectionQueueState)
-        # Zeroed memory: an all-zero ``Table`` is a valid empty table.
+        # Zeroed memory: a nil ``sessions`` list is an empty queue.
       initLock(candidate.lock)
       var published: ptr InjectionQueueState = nil
       if transport.injectionQueue.state.compareExchange(published, candidate,
@@ -314,18 +415,66 @@ else:
         deallocShared(candidate)
         result = published
 
-  template withPendingTable(transport: AcpTransport; create: static bool;
-      pending, body: untyped) =
-    ## Run ``body`` with ``pending`` naming the transport's session table,
-    ## holding the queue lock.  With ``create = false`` a transport that
-    ## never had an injection skips ``body`` instead of allocating a
-    ## queue just to find it empty.
-    let state = when create: queueState(transport)
-                else: existingQueueState(transport)
-    if state != nil:
-      withLock state.lock:
-        template pending: untyped = state.pending
-        body
+  proc injectShared(transport: AcpTransport; sessionId, text: string) =
+    ## Native :proc:`injectUserMessage`.  The text is copied into shared
+    ## memory before the lock is taken; only the link happens under it.
+    let entry = newSharedInjection(text, epochTime())
+    let state = queueState(transport)
+    withLock state.lock:
+      var session = state.sessions
+      while session != nil and not session.hasId(sessionId):
+        session = session.next
+      if session == nil:
+        session = newSharedSession(sessionId)
+        session.next = state.sessions
+        state.sessions = session
+      if session.tail == nil:
+        session.head = entry
+      else:
+        session.tail.next = entry
+      session.tail = entry
+
+  proc takeShared(transport: AcpTransport;
+      sessionId: string): seq[PendingInjection] =
+    ## Native :proc:`takeQueuedInjections`.  The session is unlinked
+    ## under the lock, so a drained session leaves nothing behind; its
+    ## entries are then copied onto the caller's heap and freed without
+    ## holding the lock, since no other thread can reach them any more.
+    let state = existingQueueState(transport)
+    if state == nil:
+      return
+    var session: ptr SharedSession = nil
+    withLock state.lock:
+      var link = addr state.sessions
+      while link[] != nil:
+        if link[].hasId(sessionId):
+          session = link[]
+          link[] = session.next
+          break
+        link = addr link[].next
+    if session != nil:
+      var entry = session.head
+      while entry != nil:
+        result.add toPendingInjection(entry)
+        entry = entry.next
+      freeSession(session)
+
+  proc peekShared(transport: AcpTransport;
+      sessionId: string): seq[PendingInjection] =
+    ## Native :proc:`peekQueuedInjections`.  The entries stay linked, so
+    ## they are copied onto the caller's heap while the lock is held.
+    let state = existingQueueState(transport)
+    if state == nil:
+      return
+    withLock state.lock:
+      var session = state.sessions
+      while session != nil and not session.hasId(sessionId):
+        session = session.next
+      if session != nil:
+        var entry = session.head
+        while entry != nil:
+          result.add toPendingInjection(entry)
+          entry = entry.next
 
 method injectUserMessage*(transport: AcpTransport;
     sessionId, text: string) {.base.} =
@@ -334,26 +483,33 @@ method injectUserMessage*(transport: AcpTransport;
   ## richer behaviour (e.g. wire-level interleaving), but
   ## :type:`NativeStdioAcpTransport` inherits this default.
   ##
-  ## Thread-safe on native builds, including the very first call on a
-  ## transport: any number of threads may inject, take and peek
-  ## concurrently.  Entries injected by one thread are delivered in
-  ## that thread's call order.  The calls borrow ``transport`` and touch
-  ## no reference count.  The caller must keep ``transport`` alive until
-  ## every thread has stopped calling, and must not copy the transport
-  ## ``ref`` -- or anything holding it, such as an ``AcpClient``'s
-  ## closures -- on two threads at once: ORC reference counts are not
-  ## atomic, so concurrent copies can free the transport early.  Hand a
-  ## worker thread a ``ptr`` or a single owned reference instead.
+  ## Thread-safe on native builds, under ``--mm:orc`` and ``--mm:refc``
+  ## alike, including the very first call on a transport: any number of
+  ## threads may inject, take and peek concurrently.  Entries injected by
+  ## one thread are delivered in that thread's call order.  The queue
+  ## keeps its own copy of ``text`` in shared memory, so the injecting
+  ## thread may exit before the entry is taken; take and peek return
+  ## copies allocated on the calling thread's heap.  The calls borrow
+  ## ``transport`` and touch no reference count.  The caller must keep
+  ## ``transport`` alive until every thread has stopped calling (under
+  ## refc: reachable from the thread that allocated it, whose collector
+  ## does not see references held by other threads), and must not copy
+  ## the transport ``ref`` -- or anything holding it, such as an
+  ## ``AcpClient``'s closures -- on another thread: under ORC reference
+  ## counts are not atomic, so concurrent copies can free the transport
+  ## early, and under refc the copy updates the count of an object on
+  ## another thread's heap.  Hand a worker thread a ``ptr`` instead.
   ## On JS there is no concurrency and no locking.
   ##
   ## ``text`` may be empty; an empty injection is still recorded so
   ## the caller can use it as a "kick" signal.  The drain side
   ## decides how to fold empty entries into the next prompt.
-  var entry = PendingInjection(text: text)
-  when not defined(js):
-    entry.receivedAt = epochTime()
-  withPendingTable(transport, create = true, pending):
-    pending.mgetOrPut(sessionId, @[]).add move(entry)
+  when defined(js):
+    var entry = PendingInjection(text: text)
+    withPendingTable(transport, create = true, pending):
+      pending.mgetOrPut(sessionId, @[]).add move(entry)
+  else:
+    injectShared(transport, sessionId, text)
 
 method takeQueuedInjections*(transport: AcpTransport;
     sessionId: string): seq[PendingInjection] {.base.} =
@@ -363,18 +519,24 @@ method takeQueuedInjections*(transport: AcpTransport;
   ## boundaries by the daemon.  Returns ``@[]`` if no pending
   ## injections.  Thread-safe, under the same terms as
   ## :proc:`injectUserMessage`.
-  withPendingTable(transport, create = false, pending):
-    # ``pop`` moves the seq out and drops the key, so a drained session
-    # leaves nothing behind in the table.
-    discard pending.pop(sessionId, result)
+  when defined(js):
+    withPendingTable(transport, create = false, pending):
+      # ``pop`` moves the seq out and drops the key, so a drained
+      # session leaves nothing behind in the table.
+      discard pending.pop(sessionId, result)
+  else:
+    result = takeShared(transport, sessionId)
 
 method peekQueuedInjections*(transport: AcpTransport;
     sessionId: string): seq[PendingInjection] {.base.} =
   ## Read-only inspection (for logging / debug).  Returns a copy of
   ## the current queue without draining it.  Thread-safe, under the
   ## same terms as :proc:`injectUserMessage`.
-  withPendingTable(transport, create = false, pending):
-    result = pending.getOrDefault(sessionId)
+  when defined(js):
+    withPendingTable(transport, create = false, pending):
+      result = pending.getOrDefault(sessionId)
+  else:
+    result = peekShared(transport, sessionId)
 
 when not defined(js):
   const

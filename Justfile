@@ -3,13 +3,23 @@ alias fmt := format
 
 paths := "--path:src --path:../nim-everywhere/src"
 
+# The injection queue is shared across threads, and its soundness depends on
+# the memory manager: refc gives every thread a private heap, orc shares one.
+# The toolchain's default is orc, but consumers build refc too (CodeTracer's
+# `ct` binary does), so the threaded test runs under both, named explicitly.
+# Each mm gets its own binary and nimcache: config.nims keys the nimcache by
+# module, not by mm, so the two builds would otherwise share one directory.
+inject-refc := "--mm:refc --threads:on -o:tests/test_inject_prompt_refc --nimcache:.nimcache/tests/test_inject_prompt_refc_d"
+inject-orc := "--mm:orc --threads:on -o:tests/test_inject_prompt_orc --nimcache:.nimcache/tests/test_inject_prompt_orc_d"
+
 build: build-native build-js
 
 build-native:
     nim c {{paths}} tests/test_acp.nim
     nim c {{paths}} tests/test_session_load.nim
     nim c {{paths}} tests/test_send_with_stream.nim
-    nim c --threads:on {{paths}} tests/test_inject_prompt.nim
+    nim c {{inject-refc}} {{paths}} tests/test_inject_prompt.nim
+    nim c {{inject-orc}} {{paths}} tests/test_inject_prompt.nim
     nim c {{paths}} tests/test_nimcache_is_worktree_local.nim
 
 build-js:
@@ -22,7 +32,8 @@ test-native:
     nim c -r {{paths}} tests/test_acp.nim
     nim c -r {{paths}} tests/test_session_load.nim
     nim c -r {{paths}} tests/test_send_with_stream.nim
-    nim c -r --threads:on {{paths}} tests/test_inject_prompt.nim
+    nim c -r {{inject-refc}} {{paths}} tests/test_inject_prompt.nim
+    nim c -r {{inject-orc}} {{paths}} tests/test_inject_prompt.nim
     nim c -r {{paths}} tests/test_nimcache_is_worktree_local.nim
 
 test-js:
@@ -35,7 +46,8 @@ lint-nim:
     nim check {{paths}} tests/test_acp.nim
     nim check {{paths}} tests/test_session_load.nim
     nim check {{paths}} tests/test_send_with_stream.nim
-    nim check --threads:on {{paths}} tests/test_inject_prompt.nim
+    nim check --mm:refc --threads:on {{paths}} tests/test_inject_prompt.nim
+    nim check --mm:orc --threads:on {{paths}} tests/test_inject_prompt.nim
     nim check {{paths}} tests/test_nimcache_is_worktree_local.nim
 
 lint-nix:

@@ -96,6 +96,11 @@ type
     ## path; ``binary`` is the ``build/test-bin/<stem>`` output.
     source: string
     binary: string
+    mm: string
+      ## ``--mm:`` for this binary; empty means the toolchain default
+      ## (orc).  The threaded queue test is built under both refc and orc
+      ## because CodeTracer's ``ct`` links nim-acp ``--mm:refc`` and a
+      ## per-thread-heap defect is invisible under orc.
 
 const portableTestSpecs: seq[AcpTestSpec] = @[
   # All three tests compile + run to exit 0 on this Linux host (native).
@@ -105,7 +110,9 @@ const portableTestSpecs: seq[AcpTestSpec] = @[
   AcpTestSpec(source: "tests/test_acp.nim",
     binary: "build/test-bin/test_acp"),
   AcpTestSpec(source: "tests/test_inject_prompt.nim",
-    binary: "build/test-bin/test_inject_prompt"),
+    binary: "build/test-bin/test_inject_prompt_refc", mm: "refc"),
+  AcpTestSpec(source: "tests/test_inject_prompt.nim",
+    binary: "build/test-bin/test_inject_prompt_orc", mm: "orc"),
   AcpTestSpec(source: "tests/test_send_with_stream.nim",
     binary: "build/test-bin/test_send_with_stream"),
 ]
@@ -142,7 +149,7 @@ package nim_acp:
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
 
-    proc emitTestPair(source, binary: string;
+    proc emitTestPair(source, binary, mm: string;
                       buildActions, executeActions: var seq[BuildActionDef]) =
       var lastSlash = -1
       for i in 0 ..< binary.len:
@@ -159,6 +166,7 @@ package nim_acp:
         source = source,
         binary = binary,
         paths = @["src"],
+        mm = mm,
         actionId = "nim_acp.test_build." & stem,
         extraInputs = @["src", "nim_acp.nimble"])
       buildActions.add(edge.action)
@@ -172,7 +180,7 @@ package nim_acp:
       executeActions.add(executeEdge)
 
     for spec in portableTestSpecs:
-      emitTestPair(spec.source, spec.binary,
+      emitTestPair(spec.source, spec.binary, spec.mm,
         testBuildActions, testExecuteActions)
 
     discard collect("test", testExecuteActions)
