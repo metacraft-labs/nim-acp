@@ -12,3 +12,6 @@ result
 # reprobuild local workspace state (repro writes .repro/ into member repos
 # too, but its ergonomics fixer only patches the workspace root)
 .repro/
+
+# repro.nim's test edges write build/test-bin/<stem> and build/nimcache/.
+build/
