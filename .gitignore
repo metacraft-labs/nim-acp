@@ -6,6 +6,7 @@ nimcache/
 tests/test_*
 !tests/*.nim
 !tests/*.sh
+!tests/*.py
 *.js
 result
 
