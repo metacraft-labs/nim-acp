@@ -15,79 +15,235 @@ concurrency:
 
 jobs:
   test:
+    defaults:
+      run:
+        working-directory: nim-acp
     strategy:
       fail-fast: false
       matrix:
-        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
+        runner:
+          [
+            [self-hosted, linux, x64],
+            [self-hosted, linux, arm64],
+            [self-hosted, macos, arm64],
+          ]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
         with:
-          repository: metacraft-labs/nim-everywhere
-          path: ../nim-everywhere
-      # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
-      # client is already shimmed in, so it exits 0 in ~50ms without applying
-      # extra_nix_config, and the next step dies on "experimental Nix feature
-      # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
-      # and then VERIFIES the features are live.
+          path: nim-acp
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          nix-github-token: ${{ github.token }}
+          substituter-preflight: fail
       # `shell: bash` is load-bearing, not style. The default `run` shell is
       # `bash -e` WITHOUT pipefail, so `cmd | tee` takes tee's exit status and a
       # failing command was reported as a passing job. `shell: bash` selects
       # `bash --noprofile --norc -eo pipefail`.
-      - run: nix develop --command just test 2>&1 | tee test.log
+      - name: Observe Linux kernel limits before the owning phase
+        id: linux_resources_before
+        if: runner.os == 'Linux'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'before',temporary:process.env.RUNNER_TEMP,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - id: original_tests
+        run: nix develop --command just test 2>&1 | tee test.log
+        shell: bash
+      - name: Observe Linux kernel limits after the owning phase
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+          ACP_KERNEL_RECEIPT: ${{ steps.linux_resources_before.outputs.receipt_path }}
+          ACP_KERNEL_DIRECTORY_IDENTITY: ${{ steps.linux_resources_before.outputs.directory_identity }}
+          ACP_KERNEL_BEFORE_SHA256: ${{ steps.linux_resources_before.outputs.snapshot_sha256 }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'after',temporary:process.env.RUNNER_TEMP,receipt:process.env.ACP_KERNEL_RECEIPT,directoryIdentity:process.env.ACP_KERNEL_DIRECTORY_IDENTITY,beforeSHA:process.env.ACP_KERNEL_BEFORE_SHA256,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Retain bounded public Linux kernel observations
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-linux-kernel-${{ github.job }}-${{ runner.arch }}
+          path: |
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
+          if-no-files-found: warn
+      - name: Qualify native owned process group outcomes
+        if: ${{ always() && (steps.original_tests.outcome == 'success' || steps.original_tests.outcome == 'failure') }}
+        run: nix develop --command bash tools/test-owned-posix-group-outcomes.sh 2>&1 | tee native-group-controls.log
+        shell: bash
+      - name: Retain native process group control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-group-controls-${{ join(matrix.runner, '-') }}
+          path: nim-acp/native-group-controls.log
+          if-no-files-found: warn
+      - name: Observe native Darwin admission after original test failure
+        if: ${{ failure() && runner.os == 'macOS' && steps.original_tests.outcome == 'failure' }}
+        run: nix develop --command nim c -r -d:acpAdmissionDiagnostics --nimcache:.nimcache/tests/acp-admission-diagnostic --out:build/test_send_with_stream_admission_diagnostic --path:src tests/test_send_with_stream.nim 2>&1 | tee admission-diagnostic.log
         shell: bash
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-log-${{ join(matrix.runner, '-') }}
-          path: test.log
+          path: nim-acp/test.log
+      - name: Retain native admission diagnostic log
+        if: ${{ always() && runner.os == 'macOS' && steps.original_tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-diagnostic-${{ join(matrix.runner, '-') }}
+          path: nim-acp/admission-diagnostic.log
+          if-no-files-found: warn
+
   lint:
+    defaults:
+      run:
+        working-directory: nim-acp
     strategy:
       fail-fast: false
       matrix:
-        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
+        runner:
+          [
+            [self-hosted, linux, x64],
+            [self-hosted, linux, arm64],
+            [self-hosted, macos, arm64],
+          ]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
         with:
-          repository: metacraft-labs/nim-everywhere
-          path: ../nim-everywhere
-      # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
-      # client is already shimmed in, so it exits 0 in ~50ms without applying
-      # extra_nix_config, and the next step dies on "experimental Nix feature
-      # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
-      # and then VERIFIES the features are live.
+          path: nim-acp
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          nix-github-token: ${{ github.token }}
+          substituter-preflight: fail
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
+      - name: Observe Linux kernel limits before the owning phase
+        id: linux_resources_before
+        if: runner.os == 'Linux'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'before',temporary:process.env.RUNNER_TEMP,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
       - run: nix develop --command just lint 2>&1 | tee lint.log
         shell: bash
+      - name: Observe Linux kernel limits after the owning phase
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+          ACP_KERNEL_RECEIPT: ${{ steps.linux_resources_before.outputs.receipt_path }}
+          ACP_KERNEL_DIRECTORY_IDENTITY: ${{ steps.linux_resources_before.outputs.directory_identity }}
+          ACP_KERNEL_BEFORE_SHA256: ${{ steps.linux_resources_before.outputs.snapshot_sha256 }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'after',temporary:process.env.RUNNER_TEMP,receipt:process.env.ACP_KERNEL_RECEIPT,directoryIdentity:process.env.ACP_KERNEL_DIRECTORY_IDENTITY,beforeSHA:process.env.ACP_KERNEL_BEFORE_SHA256,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Retain bounded public Linux kernel observations
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-linux-kernel-${{ github.job }}-${{ runner.arch }}
+          path: |
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: lint-log-${{ join(matrix.runner, '-') }}
-          path: lint.log
+          path: nim-acp/lint.log
   nix-build:
+    defaults:
+      run:
+        working-directory: nim-acp
     strategy:
       fail-fast: false
       matrix:
-        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
+        runner:
+          [
+            [self-hosted, linux, x64],
+            [self-hosted, linux, arm64],
+            [self-hosted, macos, arm64],
+          ]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: nim-acp
       # install-nix-action fails SILENTLY on the self-hosted eph-* classes: a Nix
       # client is already shimmed in, so it exits 0 in ~50ms without applying
       # extra_nix_config, and the next step dies on "experimental Nix feature
       # 'nix-command' is disabled". setup-nix writes nix.conf unconditionally
       # and then VERIFIES the features are live.
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          nix-github-token: ${{ github.token }}
+          substituter-preflight: fail
       # See the note on the first tee'd step: without pipefail, `| tee` masks failure.
       - run: nix build .#default 2>&1 | tee nix-build.log
         shell: bash
+      - name: Observe Linux kernel limits before the owning phase
+        id: linux_resources_before
+        if: runner.os == 'Linux'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'before',temporary:process.env.RUNNER_TEMP,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Observe Linux kernel limits after the owning phase
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          ACP_PRIOR_JOB_STATUS: ${{ job.status }}
+          ACP_KERNEL_RECEIPT: ${{ steps.linux_resources_before.outputs.receipt_path }}
+          ACP_KERNEL_DIRECTORY_IDENTITY: ${{ steps.linux_resources_before.outputs.directory_identity }}
+          ACP_KERNEL_BEFORE_SHA256: ${{ steps.linux_resources_before.outputs.snapshot_sha256 }}
+        with:
+          script: |
+            const root=require('path').join(process.env.GITHUB_WORKSPACE,'nim-acp');
+            const capture=require(require('path').join(root,'ci','capture-linux-cgroup.cjs'));
+            await capture({core,phase:'after',temporary:process.env.RUNNER_TEMP,receipt:process.env.ACP_KERNEL_RECEIPT,directoryIdentity:process.env.ACP_KERNEL_DIRECTORY_IDENTITY,beforeSHA:process.env.ACP_KERNEL_BEFORE_SHA256,priorJobStatus:process.env.ACP_PRIOR_JOB_STATUS});
+      - name: Retain bounded public Linux kernel observations
+        if: always() && runner.os == 'Linux' && steps.linux_resources_before.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-linux-kernel-${{ github.job }}-${{ runner.arch }}
+          path: |
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/before.json
+            ${{ steps.linux_resources_before.outputs.receipt_path }}/after.json
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: nix-build-log-${{ join(matrix.runner, '-') }}
-          path: nix-build.log
+          path: nim-acp/nix-build.log

@@ -1,7 +1,7 @@
 alias t := test
 alias fmt := format
 
-paths := "--path:src --path:../nim-everywhere/src"
+paths := "--path:src"
 
 # The injection queue is shared across threads, and its soundness depends on
 # the memory manager: refc gives every thread a private heap, orc shares one.

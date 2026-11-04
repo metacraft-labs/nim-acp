@@ -100,6 +100,9 @@
         in
         {
           checks.pre-commit = preCommit;
+          # Interpreter for the CI step that records the Linux Repro runtime receipt
+          # (.github/workflows/ci-reprobuild.yml, ci/observe_linux_runtime_build.py).
+          packages.ci-receipt-python = pkgs.python3;
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
               nim

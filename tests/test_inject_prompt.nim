@@ -326,6 +326,39 @@ suite "injectUserMessage queue":
     check transport.peekQueuedInjections("sid-exited-b").len == 0
     check churn.len == 2_000
 
+  test "test_peeked_injections_are_caller_owned_snapshots":
+    ## A peeked entry is a copy: mutating it must not change what the
+    ## queue later hands to take, and a take must hand out the original
+    ## bytes even though the producer thread that queued them has exited.
+    const count = 3
+    let transport = newStubTransport()
+    injectFromExitedThread(transport, "sid-snapshot", id = 2, count = count)
+    var first = transport.peekQueuedInjections("sid-snapshot")
+    check first.len == count
+    first[0].text[0] = 'X'
+    let taken = transport.takeQueuedInjections("sid-snapshot")
+    check taken.len == count
+    for i in 0 ..< min(taken.len, count):
+      check taken[i].text == exitedProducerText(2, i)
+    check transport.takeQueuedInjections("sid-snapshot").len == 0
+
+  test "test_empty_text_and_embedded_nul_session_ids_are_ordinary_payloads":
+    ## Empty text is a recorded "kick"; session ids and texts are byte
+    ## strings, so an embedded NUL must neither truncate nor merge sessions.
+    let transport = newStubTransport()
+    transport.injectUserMessage("binary\0session", "")
+    transport.injectUserMessage("binary", "other-session")
+    transport.injectUserMessage("binary\0session", "a\0b")
+    let binary = transport.takeQueuedInjections("binary\0session")
+    check binary.len == 2
+    if binary.len == 2:
+      check binary[0].text == ""
+      check binary[1].text == "a\0b"
+    let plain = transport.takeQueuedInjections("binary")
+    check plain.len == 1
+    if plain.len == 1:
+      check plain[0].text == "other-session"
+
   test "test_inject_default_method_works_on_native_stdio_transport":
     ## :type:`NativeStdioAcpTransport` inherits the default queue
     ## methods unchanged — verify the dispatch resolves and FIFO

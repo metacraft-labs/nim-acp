@@ -35,26 +35,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Capped to linux/x64: eph-linux-x64 is the only ephemeral runner
-          # pool that reliably comes online. The eph-linux-arm64 /
-          # eph-macos-arm64 / eph-win-x64 / eph-win-arm64 pools don't spin up
-          # and 24h-timeout; restore those legs once their pools are live.
+          # Required Reprobuild coverage; unavailable capacity stays queued.
+          # The separate Nix workflow retains its original three Unix legs.
           - os: linux
             arch: x64
             runner: [self-hosted, linux, x64]
+          - os: linux
+            arch: arm64
+            runner: [self-hosted, linux, arm64]
+          - os: macos
+            arch: arm64
+            runner: [self-hosted, macos, arm64]
+          - os: windows
+            arch: x64
+            runner: [self-hosted, windows, x64]
+          - os: windows
+            arch: arm64
+            runner: [self-hosted, windows, arm64]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      # Mint a GitHub App installation token via the CI Token Provider
-      # app so the reprobuild flake/sibling steps can clone private
-      # metacraft-labs repos (codetracer-native-recorder, runquota,
-      # repo-workspaces, etc.).  GitHub free plan restricts org-level
-      # secrets with visibility ALL from being readable in private repos,
-      # so we mint per-run tokens from the app secrets stored at repo
-      # level (CI_TOKEN_PROVIDER_APP_ID + CI_TOKEN_PROVIDER_PRIVATE_KEY).
-      # Minted before the sibling clones so the workspace-lock manifest
-      # checkout (private metacraft-manifests) can authenticate.
       - name: Mint installation token for cross-repo sibling clones
         id: ci_token
         uses: actions/create-github-app-token@v2
@@ -63,6 +64,101 @@ jobs:
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           owner: metacraft-labs
 
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        if: runner.os != 'Windows'
+      - name: Bind explicit Linux Repro runtime source
+        id: linux_runtime
+        if: matrix.os == 'linux'
+        shell: bash
+        env:
+          NIX_CONFIG: access-tokens = github.com=${{ steps.ci_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          own_sha="$(git rev-parse HEAD)"
+          test "$own_sha" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=no)"
+          own_root="$(git rev-parse --show-toplevel)"
+          receipt="$(mktemp -d "$RUNNER_TEMP/acp-repro-runtime-receipt.XXXXXXXXXX")"
+          printf 'receipt_path=%s\n' "$receipt" >> "$GITHUB_OUTPUT"
+          receipt_python_out="$(nix build --no-link --print-out-paths --no-update-lock-file "git+file://$own_root?rev=$own_sha&shallow=1#ci-receipt-python")"
+          test -x "$receipt_python_out/bin/python3"
+          receipt_python="$receipt_python_out/bin/python3"
+          package_json="$receipt/package-raw.json"
+          "$receipt_python" ci/observe_linux_runtime_build.py --receipt-directory "$receipt" -- nix build --no-link --json --no-update-lock-file 'github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d#reprobuild' > "$package_json"
+          package="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["outputs"]["out"])' "$package_json")"
+          # A self-hosted runner may retain receipts from earlier jobs. Allocate
+          # exclusively and export this job's path without touching prior evidence.
+          printf '%s\n' "$receipt_python_out" > "$receipt/python-output.txt"
+          nix path-info --derivation "$receipt_python_out" > "$receipt/python-derivation.txt"
+          sha256sum "$receipt_python" > "$receipt/python-executable.sha256"
+          "$receipt_python" --version > "$receipt/python-version.txt"
+          "$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(json.dumps({"drvPath":x[0]["drvPath"],"outputs":x[0]["outputs"]},indent=2))' "$package_json" > "$receipt/package.json"
+          test -x "$package/bin/repro"
+          test -x "$package/bin/.repro-wrapped"
+          test -x "$package/bin/.reprobuild-wrapped"
+          test -x "$package/libexec/reprobuild-nix-daemon"
+          printf 'REPROBUILD_REPRO=%s/bin/repro\n' "$package" >> "$GITHUB_ENV"
+          printf 'REPROBUILD_NIX_DAEMON_BIN=%s/libexec/reprobuild-nix-daemon\n' "$package" >> "$GITHUB_ENV"
+          printf '%s/bin\n' "$package" >> "$GITHUB_PATH"
+          nix flake metadata --json --no-update-lock-file 'github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d' > "$receipt/source-raw.json"
+          "$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["locked"]["rev"]=="76659f5730ecf698b1963c656494d2cb66eb256d"; print(json.dumps({"locked":x["locked"],"path":x["path"]},indent=2))' "$receipt/source-raw.json" > "$receipt/source.json"
+          source_root="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["locked"]["rev"]=="76659f5730ecf698b1963c656494d2cb66eb256d"; print(x["path"])' "$receipt/source-raw.json")"
+          nix flake prefetch --json --no-update-lock-file 'github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d' > "$receipt/source-prefetch.json"
+          "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); prefetch=json.load(open(sys.argv[2])); assert metadata["locked"]["rev"]=="76659f5730ecf698b1963c656494d2cb66eb256d"; assert prefetch["storePath"]==metadata["path"]; assert prefetch["hash"]==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/source-prefetch.json"
+          nix hash path --type sha256 --sri "$source_root" > "$receipt/source-realized-nar-hash.txt"
+          "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); assert open(sys.argv[2]).read().strip()==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/source-realized-nar-hash.txt"
+          sha256sum "$source_root/flake.nix" "$source_root/flake.lock" "$package/bin/repro" "$package/bin/.repro-wrapped" "$package/bin/.reprobuild-wrapped" "$package/libexec/reprobuild-nix-daemon" | tee "$receipt/identities.sha256"
+
+          runtime_system="$("$receipt_python" -c 'import platform,sys; assert sys.platform=="linux"; machine=platform.machine(); assert machine in ("x86_64","aarch64","arm64"); print({"x86_64":"x86_64-linux","aarch64":"aarch64-linux","arm64":"aarch64-linux"}[machine])')"
+          package_drv="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["drvPath"])' "$package_json")"
+          nix derivation show "$package_drv" > "$receipt/package-derivation-raw.json"
+          drv_source="$("$receipt_python" ci/nix_derivation.py "$receipt/package-derivation-raw.json" "$package_drv" "$package" "$runtime_system")"
+          nix hash path --type sha256 --sri "$drv_source" > "$receipt/package-derivation-source-nar-hash.txt"
+          "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); actual=open(sys.argv[2]).read().strip(); assert actual==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/package-derivation-source-nar-hash.txt"
+
+          # The standalone CLI package does not carry the RunQuota daemon.
+          # Select its public package through this exact SDK's locked input, so
+          # the SDK's follows graph and source revision govern the daemon too.
+          runquota_expr="(builtins.getFlake \"github:metacraft-labs/reprobuild/76659f5730ecf698b1963c656494d2cb66eb256d\").inputs.runquota-src.packages.$runtime_system.default"
+          nix build --no-link --json --no-update-lock-file --expr "$runquota_expr" > "$receipt/runquota-package-raw.json"
+          runquota_package="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["outputs"]["out"])' "$receipt/runquota-package-raw.json")"
+          runquota_drv="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["drvPath"])' "$receipt/runquota-package-raw.json")"
+          nix derivation show "$runquota_drv" > "$receipt/runquota-derivation-raw.json"
+          runquota_drv_source="$("$receipt_python" ci/nix_derivation.py "$receipt/runquota-derivation-raw.json" "$runquota_drv" "$runquota_package" "$runtime_system")"
+          nix hash path --type sha256 --sri "$runquota_drv_source" > "$receipt/runquota-derivation-source-nar-hash.txt"
+          nix path-info --json --recursive "$runquota_package" > "$receipt/runquota-closure.json"
+          "$receipt_python" - "$source_root" "$receipt" "$runquota_package" "$runquota_drv" "$runtime_system" <<'PY_RUNQUOTA'
+          import hashlib,json,os,sys
+          from pathlib import Path
+          source,receipt,package,drv,system=sys.argv[1:];receipt=Path(receipt);package=Path(package)
+          lock=json.loads((Path(source)/'flake.lock').read_text());node=lock['nodes'][lock['nodes'][lock['root']]['inputs']['runquota-src']]['locked']
+          assert node['type']=='github' and node['owner']=='metacraft-labs' and node['repo']=='runquota' and len(node['rev'])==40
+          assert (receipt/'runquota-derivation-source-nar-hash.txt').read_text().strip()==node['narHash']
+          images={};expected_machine={'x86_64-linux':62,'aarch64-linux':183}[system]
+          for name in ('runquota','runquotad'):
+              executable=package/'bin'/name;assert executable.is_file() and os.access(executable,os.X_OK)
+              body=executable.read_bytes();assert body[:6]==b'\x7fELF\x02\x01' and int.from_bytes(body[18:20],'little')==expected_machine
+              images[name]=hashlib.sha256(body).hexdigest()
+          closure=json.loads((receipt/'runquota-closure.json').read_text());rows=closure if isinstance(closure,list) else [dict(value,path=key) for key,value in closure.items()]
+          assert any(row['path']==str(package) for row in rows)
+          (receipt/'runquota-identity.json').write_text(json.dumps({'selectedSDK':'76659f5730ecf698b1963c656494d2cb66eb256d','lockedRunQuotaInput':node,'system':system,'package':str(package),'drvPath':drv,'imagesSHA256':images,'closureSHA256':hashlib.sha256((receipt/'runquota-closure.json').read_bytes()).hexdigest()},indent=2)+'\n')
+          PY_RUNQUOTA
+          printf 'RUNQUOTAD_BIN=%s/bin/runquotad\n' "$runquota_package" >> "$GITHUB_ENV"
+          printf '%s/bin\n' "$runquota_package" >> "$GITHUB_PATH"
+
+      - name: Retain Linux runtime source and package identities
+        if: always() && matrix.os == 'linux' && steps.linux_runtime.outputs.receipt_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-repro-runtime-${{ matrix.arch }}
+          path: ${{ steps.linux_runtime.outputs.receipt_path }}
+          if-no-files-found: warn
+          retention-days: 7
+
+      # Setup consumes Repro to materialize this environment. Acquire the exact
+      # declared Linux package first, including on runners without a release asset.
+
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
@@ -70,22 +166,67 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
+          repro-from-source: ${{ matrix.os == 'linux' && 'false' || 'true' }}
+          repro-build-pin: "76659f5730ecf698b1963c656494d2cb66eb256d"
           gh-token: ${{ steps.ci_token.outputs.token }}
           # Publish repro build outputs to the fleet binary cache (per-repo
           # secrets; org-wide secrets aren't readable in private repos).
           repro-publish-key: ${{ secrets.REPRO_PUBLISH_KEY }}
           repro-publish-cert: ${{ secrets.REPRO_PUBLISH_CERT }}
 
+      - name: Report exact Repro environment
+        if: runner.os != 'Windows'
+        run: |
+          pwd
+          git rev-parse HEAD
+          command -v repro
+          repro --version
+
+      - name: Report exact Windows Repro environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-Location
+          git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Get-Command repro -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          repro --version
+          exit $LASTEXITCODE
+
+      - name: Admit declared native Windows x64 fixture tools
+        if: runner.os == 'Windows' && matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          & ./ci/admit-native-windows-x64-fixture-tools.ps1 | Tee-Object -FilePath native-windows-fixture-tools.json
+          exit $LASTEXITCODE
+
+      - name: Retain declared Windows fixture tool admission
+        if: always() && runner.os == 'Windows' && matrix.arch == 'x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-x64-fixture-tools
+          path: nim-acp/native-windows-fixture-tools.json
+          if-no-files-found: warn
+
+      - name: Admit the declared native Windows Just task runner
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          & ./ci/admit-native-windows-just-tool.ps1 | Tee-Object -FilePath native-windows-just-tool.json
+          exit $LASTEXITCODE
+
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine identically to `just build`.
-        run: dev-exec repro build
+        run: dev-exec repro build ${{ runner.os == 'Linux' && '--tool-provisioning=nix' || '' }}
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test
+        run: dev-exec repro test ${{ runner.os == 'Linux' && '--tool-provisioning=nix' || '' }}
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so
@@ -95,6 +236,24 @@ jobs:
 
       - name: just test (cross-check)
         run: dev-exec just test
+
+      - name: Observe native Darwin cleanup after original failure
+        if: ${{ failure() && runner.os == 'macOS' }}
+        shell: bash
+        run: dev-exec nim c -r -d:acpAdmissionDiagnostics --nimcache:.nimcache/tests/acp-repro-admission-diagnostic --out:build/test_send_with_stream_repro_admission_diagnostic --path:src tests/test_send_with_stream.nim 2>&1 | tee repro-admission-diagnostic.log
+
+      - name: Observe declared Windows x64 fixture tools after original failure
+        if: ${{ failure() && runner.os == 'Windows' && matrix.arch == 'x64' }}
+        shell: pwsh
+        run: |
+          & ./ci/observe-cached-native-x64-git-tools.ps1 | Tee-Object -FilePath windows-fixture-tools-diagnostic.json
+          exit $LASTEXITCODE
+
+      - name: Retain selected Windows x64 installed Nim source after original failure
+        if: ${{ failure() && runner.os == 'Windows' && matrix.arch == 'x64' }}
+        shell: pwsh
+        run: |
+          & ./ci/observe-selected-windows-nim-runtime.ps1 | Tee-Object -FilePath windows-nim-runtime-diagnostic.json
 
       # Diagnostics on failure. Three things below are load-bearing:
       #
@@ -133,6 +292,11 @@ jobs:
           path: |
             .repro/build/*/build-failure-report.json
             .repro/build/*/build-engine-cache/actions/
+            .repro/build/repro/path-only-tool-identities.inspect.json
+            repro-admission-diagnostic.log
+            windows-fixture-tools-diagnostic.json
+            native-windows-just-tool.json
+            windows-nim-runtime-diagnostic.json
           include-hidden-files: true
           retention-days: 7
           if-no-files-found: warn
