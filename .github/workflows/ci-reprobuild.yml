@@ -98,8 +98,17 @@ jobs:
           test -x "$package/bin/.repro-wrapped"
           test -x "$package/bin/.reprobuild-wrapped"
           test -x "$package/libexec/reprobuild-nix-daemon"
-          printf 'REPROBUILD_REPRO=%s/bin/repro\n' "$package" >> "$GITHUB_ENV"
-          printf 'REPROBUILD_NIX_DAEMON_BIN=%s/libexec/reprobuild-nix-daemon\n' "$package" >> "$GITHUB_ENV"
+          # This lane takes the engine from a Nix package, not from
+          # setup-reprobuild's source bootstrap, so nothing else exports an
+          # interpreter. refresh-build-auth runs outside any dev shell, where
+          # the runner image has no `python3`; it reads
+          # REPROBUILD_BOOTSTRAP_PYTHON first
+          # (metacraft-github-actions refresh-build-auth/refresh.sh).
+          {
+            printf 'REPROBUILD_REPRO=%s/bin/repro\n' "$package"
+            printf 'REPROBUILD_NIX_DAEMON_BIN=%s/libexec/reprobuild-nix-daemon\n' "$package"
+            printf 'REPROBUILD_BOOTSTRAP_PYTHON=%s\n' "$receipt_python"
+          } >> "$GITHUB_ENV"
           printf '%s/bin\n' "$package" >> "$GITHUB_PATH"
           nix flake metadata --json --no-update-lock-file 'github:metacraft-labs/reprobuild/413830138a7a73293dfc551d623f7bf2cb0ab62c' > "$receipt/source-raw.json"
           "$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["locked"]["rev"]=="413830138a7a73293dfc551d623f7bf2cb0ab62c"; print(json.dumps({"locked":x["locked"],"path":x["path"]},indent=2))' "$receipt/source-raw.json" > "$receipt/source.json"
