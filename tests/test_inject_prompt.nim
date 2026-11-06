@@ -14,7 +14,7 @@
 when defined(js):
   {.error: "Inject-prompt tests are native-only.".}
 
-import std/[os, times, locks]
+import std/[atomics, os, times]
 import unittest
 import nim_acp
 
@@ -69,50 +69,146 @@ proc spawnFakeAcpAgent(): NativeStdioAcpTransport =
                     hardDeadlineMs = 60_000)
 
 # --------------------------------------------------------------------------- #
-#  Concurrency-test scaffolding.  Two threads share a single transport;
-#  one injects 1000 entries, the other repeatedly drains.  At the end
-#  we drain whatever's left and check the union equals the producer's
-#  output exactly.
+#  Concurrency-test scaffolding.  Producer threads share one transport
+#  with one draining consumer, which is the main thread itself.  Every
+#  thread waits on ``start`` so they hit the fresh transport together:
+#  that is what exercises concurrent first use, when no queue exists
+#  yet.  The consumer keeps draining until every producer has
+#  finished, then one final take collects whatever landed after its
+#  previous take.
+#
+#  The consumer runs on the main thread, not on a worker, so that the
+#  ``drained`` seq it builds lives on the heap of the thread that reads
+#  it afterwards.  Under ``--mm:refc`` every thread has a private heap
+#  and a thread's heap pages are unmapped when it exits, so a seq
+#  grown on a joined worker would be read from freed memory.  The
+#  producers allocate only their own message strings, which the queue
+#  copies into shared memory before the producer exits.
+#
+#  Threads reach the shared state through a ``ptr`` to an object on the
+#  test's stack, so no thread copies the transport ``ref`` (that copy
+#  would itself be a cross-thread reference-count update).  All
+#  cross-thread signalling goes through atomics with explicit ordering.
 # --------------------------------------------------------------------------- #
 
 type
-  ConcurrencyState = object
+  Exchange = object
     transport: AcpTransport
     sessionId: string
-    iterations: int
-    producerDone: bool
-    drained: seq[string]
-    drainedLock: Lock
+    producers: int
+    perProducer: int
+    start: Atomic[bool]
+    producersDone: Atomic[int]
+  ProducerArgs = object
+    exchange: ptr Exchange
+    id: int
 
-var sharedState: ConcurrencyState
+proc messageText(producers, id, i: int): string =
+  ## A single producer sends ``msg-<i>``, as the original test did; with
+  ## several, each message also names its producer.
+  if producers == 1: "msg-" & $i
+  else: "p" & $id & "-msg-" & $i
 
-proc producerThread() {.thread, gcsafe.} =
+proc awaitStart(exchange: ptr Exchange) =
+  while not exchange.start.load(moAcquire):
+    cpuRelax()
+
+proc producerThread(args: ProducerArgs) {.thread.} =
+  let exchange = args.exchange
+  awaitStart(exchange)
+  # Method dispatch is not provably GC-safe to the compiler; these calls
+  # only borrow the transport and touch no global state.
   {.cast(gcsafe).}:
-    for i in 0 ..< sharedState.iterations:
-      sharedState.transport.injectUserMessage(
-        sharedState.sessionId, "msg-" & $i)
+    for i in 0 ..< exchange.perProducer:
+      exchange.transport.injectUserMessage(exchange.sessionId,
+        messageText(exchange.producers, args.id, i))
+  discard exchange.producersDone.fetchAdd(1, moRelease)
 
-proc consumerThread() {.thread, gcsafe.} =
+proc drainUntilProducersDone(exchange: ptr Exchange): seq[string] =
+  ## The consumer loop, run on the calling (main) thread while the
+  ## producers run on workers.  Returns everything drained, in drain
+  ## order.
+  while true:
+    # Read the completion count BEFORE draining.  The acquire load
+    # pairs with each producer's release increment, so once it reports
+    # every producer done, the take below sees all of their injections
+    # and nothing can be left behind after the loop ends.
+    let finished = exchange.producersDone.load(moAcquire) ==
+      exchange.producers
+    for entry in exchange.transport.takeQueuedInjections(
+        exchange.sessionId):
+      result.add entry.text
+    if finished:
+      break
+
+proc runExchange(producers, perProducer: int): seq[string] =
+  ## Run one exchange on a fresh transport and return everything the
+  ## consumer drained, in drain order.
+  var exchange = Exchange(transport: newStubTransport(),
+    sessionId: "sid-concurrent", producers: producers,
+    perProducer: perProducer)
+  var producerThreads = newSeq[Thread[ProducerArgs]](producers)
+  for id in 0 ..< producers:
+    createThread(producerThreads[id], producerThread,
+      ProducerArgs(exchange: addr exchange, id: id))
+  exchange.start.store(true, moRelease)
+  result = drainUntilProducersDone(addr exchange)
+  joinThreads(producerThreads)
+  # Nothing may remain queued once the consumer has seen every producer
+  # finish.
+  doAssert exchange.transport.peekQueuedInjections(exchange.sessionId).len == 0
+
+proc checkExchange(drained: seq[string]; producers, perProducer: int) =
+  ## Every message arrives exactly once, and each producer's messages
+  ## arrive in that producer's order.  The length check plus an exact
+  ## per-producer subsequence leaves no room for a loss or a duplicate.
+  check drained.len == producers * perProducer
+  for id in 0 ..< producers:
+    var next = 0
+    for text in drained:
+      if next < perProducer and text == messageText(producers, id, next):
+        inc next
+    check next == perProducer
+
+# --------------------------------------------------------------------------- #
+#  Exited-producer scaffolding.  A producer thread injects and then
+#  EXITS before anyone takes.  Under ``--mm:refc`` a thread's heap pages
+#  are unmapped when the thread exits (``deallocOsPages`` in
+#  ``threadProcWrapStackFrame``), so a queue that kept anything on the
+#  producer's heap -- a table bucket array, a key, a seq or string
+#  buffer -- would hand the taker freed memory.  The texts are long
+#  and distinct so a surviving but overwritten buffer cannot pass for
+#  the original.
+# --------------------------------------------------------------------------- #
+
+type
+  ExitedProducerArgs = object
+    transport: ptr AcpTransport
+    sessionId: ptr string
+    id: int
+    count: int
+
+proc exitedProducerText(id, i: int): string =
+  result = "exited-p" & $id & "-msg-" & $i & "-"
+  for k in 0 ..< 64 + i mod 64:
+    result.add char(ord('a') + (id + i + k) mod 26)
+
+proc exitedProducerThread(args: ExitedProducerArgs) {.thread.} =
+  # See ``producerThread`` on the cast.
   {.cast(gcsafe).}:
-    while true:
-      let batch = sharedState.transport.takeQueuedInjections(
-        sharedState.sessionId)
-      if batch.len > 0:
-        acquire(sharedState.drainedLock)
-        for entry in batch:
-          sharedState.drained.add entry.text
-        release(sharedState.drainedLock)
-      if sharedState.producerDone:
-        # Producer is done — one final drain to capture anything that
-        # landed between the last take and the producerDone flip.
-        let tail = sharedState.transport.takeQueuedInjections(
-          sharedState.sessionId)
-        if tail.len > 0:
-          acquire(sharedState.drainedLock)
-          for entry in tail:
-            sharedState.drained.add entry.text
-          release(sharedState.drainedLock)
-        break
+    for i in 0 ..< args.count:
+      args.transport[].injectUserMessage(args.sessionId[],
+        exitedProducerText(args.id, i))
+
+proc injectFromExitedThread(transport: AcpTransport; sessionId: string;
+    id, count: int) =
+  ## Inject ``count`` messages from a fresh thread and return only once
+  ## that thread has exited.
+  var thread: Thread[ExitedProducerArgs]
+  createThread(thread, exitedProducerThread, ExitedProducerArgs(
+    transport: unsafeAddr transport, sessionId: unsafeAddr sessionId,
+    id: id, count: count))
+  joinThread(thread)
 
 # --------------------------------------------------------------------------- #
 #  Suite.
@@ -172,25 +268,96 @@ suite "injectUserMessage queue":
     ## Two threads — one producing, one consuming — exchange 1000
     ## messages.  Final drained sequence must equal the producer's
     ## output in FIFO order with no duplicates and no losses.
-    sharedState = ConcurrencyState(
-      transport: newStubTransport(),
-      sessionId: "sid-concurrent",
-      iterations: 1000,
-      producerDone: false,
-      drained: @[])
-    initLock(sharedState.drainedLock)
-    var producer: Thread[void]
-    var consumer: Thread[void]
-    createThread(producer, producerThread)
-    createThread(consumer, consumerThread)
-    joinThread(producer)
-    sharedState.producerDone = true
-    joinThread(consumer)
-    deinitLock(sharedState.drainedLock)
-    check sharedState.drained.len == sharedState.iterations
+    let drained = runExchange(producers = 1, perProducer = 1000)
+    check drained.len == 1000
     # FIFO per producer thread: msg-0, msg-1, ... msg-999.
-    for i in 0 ..< sharedState.iterations:
-      check sharedState.drained[i] == "msg-" & $i
+    for i in 0 ..< min(drained.len, 1000):
+      check drained[i] == "msg-" & $i
+
+  test "test_concurrent_inject_take_stress":
+    ## The exchange above, repeated on fresh transports.  A single run
+    ## of a racy queue passes often enough to hide the race; repeating
+    ## it also exercises queue creation and destruction every round.
+    for round in 0 ..< 25:
+      checkExchange(runExchange(producers = 1, perProducer = 1000),
+        producers = 1, perProducer = 1000)
+
+  test "test_concurrent_first_use_keeps_every_message":
+    ## Four producers inject into a transport that has no queue yet,
+    ## released together, while a consumer drains.  If concurrent first
+    ## use could build two queues, the injections that went into the
+    ## discarded one would be lost.
+    for round in 0 ..< 25:
+      checkExchange(runExchange(producers = 4, perProducer = 250),
+        producers = 4, perProducer = 250)
+
+  test "test_injections_outlive_the_producer_thread":
+    ## Two producer threads, each the only one to touch its session,
+    ## inject and exit before the main thread looks.  The first of them
+    ## is also the queue's first user, so it is the thread that creates
+    ## the queue.  Every text must still read back intact, in order, and
+    ## the queue must keep working for a later inject from the main
+    ## thread into a session a dead thread created.
+    const count = 200
+    let transport = newStubTransport()
+    injectFromExitedThread(transport, "sid-exited-a", id = 0, count = count)
+    injectFromExitedThread(transport, "sid-exited-b", id = 1, count = count)
+    # Churn the main thread's heap so memory a dead thread used to hold
+    # is likely to be handed out again before the reads below.
+    var churn: seq[string]
+    for i in 0 ..< 2_000:
+      churn.add exitedProducerText(7, i)
+    let peeked = transport.peekQueuedInjections("sid-exited-a")
+    check peeked.len == count
+    for i in 0 ..< min(peeked.len, count):
+      check peeked[i].text == exitedProducerText(0, i)
+    transport.injectUserMessage("sid-exited-a", "from-main")
+    let a = transport.takeQueuedInjections("sid-exited-a")
+    check a.len == count + 1
+    for i in 0 ..< min(a.len, count):
+      check a[i].text == exitedProducerText(0, i)
+    if a.len == count + 1:
+      check a[count].text == "from-main"
+    let b = transport.takeQueuedInjections("sid-exited-b")
+    check b.len == count
+    for i in 0 ..< min(b.len, count):
+      check b[i].text == exitedProducerText(1, i)
+    check transport.peekQueuedInjections("sid-exited-a").len == 0
+    check transport.peekQueuedInjections("sid-exited-b").len == 0
+    check churn.len == 2_000
+
+  test "test_peeked_injections_are_caller_owned_snapshots":
+    ## A peeked entry is a copy: mutating it must not change what the
+    ## queue later hands to take, and a take must hand out the original
+    ## bytes even though the producer thread that queued them has exited.
+    const count = 3
+    let transport = newStubTransport()
+    injectFromExitedThread(transport, "sid-snapshot", id = 2, count = count)
+    var first = transport.peekQueuedInjections("sid-snapshot")
+    check first.len == count
+    first[0].text[0] = 'X'
+    let taken = transport.takeQueuedInjections("sid-snapshot")
+    check taken.len == count
+    for i in 0 ..< min(taken.len, count):
+      check taken[i].text == exitedProducerText(2, i)
+    check transport.takeQueuedInjections("sid-snapshot").len == 0
+
+  test "test_empty_text_and_embedded_nul_session_ids_are_ordinary_payloads":
+    ## Empty text is a recorded "kick"; session ids and texts are byte
+    ## strings, so an embedded NUL must neither truncate nor merge sessions.
+    let transport = newStubTransport()
+    transport.injectUserMessage("binary\0session", "")
+    transport.injectUserMessage("binary", "other-session")
+    transport.injectUserMessage("binary\0session", "a\0b")
+    let binary = transport.takeQueuedInjections("binary\0session")
+    check binary.len == 2
+    if binary.len == 2:
+      check binary[0].text == ""
+      check binary[1].text == "a\0b"
+    let plain = transport.takeQueuedInjections("binary")
+    check plain.len == 1
+    if plain.len == 1:
+      check plain[0].text == "other-session"
 
   test "test_inject_default_method_works_on_native_stdio_transport":
     ## :type:`NativeStdioAcpTransport` inherits the default queue
