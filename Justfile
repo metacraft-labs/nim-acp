@@ -4,7 +4,8 @@ alias fmt := format
 paths := "--path:src"
 
 # The injection queue is shared across threads, and its soundness depends on
-# the memory manager: refc gives every thread a private heap, orc shares one.
+# the memory manager: refc gives every thread a private heap, and orc allocates
+# from the calling thread's region.
 # The toolchain's default is orc, but consumers build refc too (CodeTracer's
 # `ct` binary does), so the threaded test runs under both, named explicitly.
 # Each mm gets its own binary and nimcache: config.nims keys the nimcache by

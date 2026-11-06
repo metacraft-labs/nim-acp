@@ -32,7 +32,7 @@ when defined(js):
       pending: Table[string, seq[PendingInjection]]
 else:
   # Every byte the native queue holds lives in manually managed shared
-  # memory (``allocShared``), and nothing in it is GC-managed: no
+  # memory (``malloc``, see ``sharedMalloc``), and nothing in it is GC-managed: no
   # ``string``, ``seq``, ``Table`` or ``ref``.  Text crosses into and out
   # of the queue only as a byte copy, made on the calling thread.  This
   # is what makes the queue sound under every memory manager its
@@ -49,8 +49,9 @@ else:
   #   crashed ``test_injections_outlive_the_producer_thread``.
   #   CodeTracer's ``ct`` binary builds ``--mm:refc`` and links this
   #   module.
-  # * Under ``--mm:orc`` the heap is shared, but reference counts are
-  #   not atomic, so the same rule keeps ``ref`` out of shared memory.
+  # * Under ``--mm:orc`` reference counts are not atomic, so the same
+  #   rule keeps ``ref`` out of shared memory.  The blocks also come from
+  #   the C allocator rather than ``allocShared``; see ``sharedMalloc``.
   #
   # Sessions are a singly linked list rather than a hash table: a
   # transport carries a handful of live sessions at a time, and a
@@ -75,7 +76,7 @@ else:
       id: UncheckedArray[char]
     InjectionQueueState = object
       ## The shared part of an :type:`InjectionQueue`.  It lives in
-      ## shared memory (``createShared``), NOT behind a ``ref``: a
+      ## shared memory (``sharedCalloc``), NOT behind a ``ref``: a
       ## ``ref`` that two threads copy and destroy concurrently loses
       ## count updates under ORC and is freed while still in use, which
       ## is exactly how the earlier ``ref``-based queue crashed under
@@ -106,11 +107,42 @@ else:
     doAssert supportsCopyMem(SharedSession)
     doAssert supportsCopyMem(InjectionQueueState)
 
+  # The C allocator, not ``allocShared``.  Under ``--mm:orc`` and ``arc``
+  # ``allocShared`` is the calling thread's own allocator, and a block freed
+  # from another thread is handed back to its owner's region.  On Nim
+  # releases that keep that region in thread-local storage, the region is
+  # gone once the allocating thread has exited, and the free then reads
+  # freed memory: ``test_inject_prompt_orc`` died with SIGSEGV in
+  # ``addToSharedFreeList`` (called from ``freeSession``) on Windows with
+  # Nim 2.2.8.  The queue promises that an injecting thread may exit before
+  # its entry is taken, so the blocks must not belong to any thread.
+  # ``malloc`` and ``free`` are thread-safe and owner-less on every
+  # platform and memory manager.
+  proc cMalloc(size: csize_t): pointer {.importc: "malloc",
+      header: "<stdlib.h>".}
+  proc cCalloc(count, size: csize_t): pointer {.importc: "calloc",
+      header: "<stdlib.h>".}
+  proc cFree(p: pointer) {.importc: "free", header: "<stdlib.h>".}
+
+  proc sharedMalloc(size: int): pointer =
+    result = cMalloc(csize_t(size))
+    if result == nil:
+      raise newException(OutOfMemDefect, "out of memory")
+
+  proc sharedCalloc(size: int): pointer =
+    ## Zero-filled, like ``allocShared0``.
+    result = cCalloc(1, csize_t(size))
+    if result == nil:
+      raise newException(OutOfMemDefect, "out of memory")
+
+  proc sharedFree(p: pointer) =
+    cFree(p)
+
   proc newSharedInjection(text: string;
       receivedAt: float): ptr SharedInjection =
     ## Copy ``text`` into a fresh, unlinked shared entry.
     result = cast[ptr SharedInjection](
-      allocShared(sizeof(SharedInjection) + text.len))
+      sharedMalloc(sizeof(SharedInjection) + text.len))
     result.next = nil
     result.receivedAt = receivedAt
     result.len = text.len
@@ -120,7 +152,7 @@ else:
   proc newSharedSession(sessionId: string): ptr SharedSession =
     ## Copy ``sessionId`` into a fresh, empty, unlinked shared session.
     result = cast[ptr SharedSession](
-      allocShared0(sizeof(SharedSession) + sessionId.len))
+      sharedCalloc(sizeof(SharedSession) + sessionId.len))
     result.idLen = sessionId.len
     if sessionId.len > 0:
       copyMem(addr result.id[0], unsafeAddr sessionId[0], sessionId.len)
@@ -141,9 +173,9 @@ else:
     var entry = session.head
     while entry != nil:
       let next = entry.next
-      deallocShared(entry)
+      sharedFree(entry)
       entry = next
-    deallocShared(session)
+    sharedFree(session)
 
   # The destroy body is shared across both `=destroy` signatures below.
   # The by-value `proc =destroy(x: T)` is accepted only under the destructor
@@ -179,7 +211,7 @@ else:
         freeSession(sessions)
         sessions = next
       deinitLock(state.lock)
-      deallocShared(state)
+      sharedFree(state)
 
   when defined(gcDestructors):
     proc `=destroy`(queue: InjectionQueue) =
@@ -406,7 +438,8 @@ else:
     ## uses the winner's, so no injection can land in a discarded queue.
     result = existingQueueState(transport)
     if result == nil:
-      let candidate = createShared(InjectionQueueState)
+      let candidate = cast[ptr InjectionQueueState](
+        sharedCalloc(sizeof(InjectionQueueState)))
         # Zeroed memory: a nil ``sessions`` list is an empty queue.
       initLock(candidate.lock)
       var published: ptr InjectionQueueState = nil
@@ -415,7 +448,7 @@ else:
         result = candidate
       else:
         deinitLock(candidate.lock)
-        deallocShared(candidate)
+        sharedFree(candidate)
         result = published
 
   proc injectShared(transport: AcpTransport; sessionId, text: string) =
