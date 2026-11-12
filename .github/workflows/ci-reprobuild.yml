@@ -85,7 +85,7 @@ jobs:
           test -x "$receipt_python_out/bin/python3"
           receipt_python="$receipt_python_out/bin/python3"
           package_json="$receipt/package-raw.json"
-          "$receipt_python" ci/observe_linux_runtime_build.py --receipt-directory "$receipt" -- nix build --no-link --json --no-update-lock-file 'github:metacraft-labs/reprobuild/413830138a7a73293dfc551d623f7bf2cb0ab62c#reprobuild' > "$package_json"
+          "$receipt_python" ci/observe_linux_runtime_build.py --receipt-directory "$receipt" -- nix build --no-link --json --no-update-lock-file 'github:metacraft-labs/reprobuild/9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0#reprobuild' > "$package_json"
           package="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["outputs"]["out"])' "$package_json")"
           # A self-hosted runner may retain receipts from earlier jobs. Allocate
           # exclusively and export this job's path without touching prior evidence.
@@ -110,11 +110,11 @@ jobs:
             printf 'REPROBUILD_BOOTSTRAP_PYTHON=%s\n' "$receipt_python"
           } >> "$GITHUB_ENV"
           printf '%s/bin\n' "$package" >> "$GITHUB_PATH"
-          nix flake metadata --json --no-update-lock-file 'github:metacraft-labs/reprobuild/413830138a7a73293dfc551d623f7bf2cb0ab62c' > "$receipt/source-raw.json"
-          "$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["locked"]["rev"]=="413830138a7a73293dfc551d623f7bf2cb0ab62c"; print(json.dumps({"locked":x["locked"],"path":x["path"]},indent=2))' "$receipt/source-raw.json" > "$receipt/source.json"
-          source_root="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["locked"]["rev"]=="413830138a7a73293dfc551d623f7bf2cb0ab62c"; print(x["path"])' "$receipt/source-raw.json")"
-          nix flake prefetch --json --no-update-lock-file 'github:metacraft-labs/reprobuild/413830138a7a73293dfc551d623f7bf2cb0ab62c' > "$receipt/source-prefetch.json"
-          "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); prefetch=json.load(open(sys.argv[2])); assert metadata["locked"]["rev"]=="413830138a7a73293dfc551d623f7bf2cb0ab62c"; assert prefetch["storePath"]==metadata["path"]; assert prefetch["hash"]==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/source-prefetch.json"
+          nix flake metadata --json --no-update-lock-file 'github:metacraft-labs/reprobuild/9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0' > "$receipt/source-raw.json"
+          "$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["locked"]["rev"]=="9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0"; print(json.dumps({"locked":x["locked"],"path":x["path"]},indent=2))' "$receipt/source-raw.json" > "$receipt/source.json"
+          source_root="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["locked"]["rev"]=="9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0"; print(x["path"])' "$receipt/source-raw.json")"
+          nix flake prefetch --json --no-update-lock-file 'github:metacraft-labs/reprobuild/9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0' > "$receipt/source-prefetch.json"
+          "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); prefetch=json.load(open(sys.argv[2])); assert metadata["locked"]["rev"]=="9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0"; assert prefetch["storePath"]==metadata["path"]; assert prefetch["hash"]==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/source-prefetch.json"
           nix hash path --type sha256 --sri "$source_root" > "$receipt/source-realized-nar-hash.txt"
           "$receipt_python" -c 'import json,sys; metadata=json.load(open(sys.argv[1])); assert open(sys.argv[2]).read().strip()==metadata["locked"]["narHash"]' "$receipt/source-raw.json" "$receipt/source-realized-nar-hash.txt"
           sha256sum "$source_root/flake.nix" "$source_root/flake.lock" "$package/bin/repro" "$package/bin/.repro-wrapped" "$package/bin/.reprobuild-wrapped" "$package/libexec/reprobuild-nix-daemon" | tee "$receipt/identities.sha256"
@@ -129,7 +129,7 @@ jobs:
           # The standalone CLI package does not carry the RunQuota daemon.
           # Select its public package through this exact SDK's locked input, so
           # the SDK's follows graph and source revision govern the daemon too.
-          runquota_expr="(builtins.getFlake \"github:metacraft-labs/reprobuild/413830138a7a73293dfc551d623f7bf2cb0ab62c\").inputs.runquota-src.packages.$runtime_system.default"
+          runquota_expr="(builtins.getFlake \"github:metacraft-labs/reprobuild/9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0\").inputs.runquota-src.packages.$runtime_system.default"
           nix build --no-link --json --no-update-lock-file --expr "$runquota_expr" > "$receipt/runquota-package-raw.json"
           runquota_package="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["outputs"]["out"])' "$receipt/runquota-package-raw.json")"
           runquota_drv="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["drvPath"])' "$receipt/runquota-package-raw.json")"
@@ -151,7 +151,7 @@ jobs:
               images[name]=hashlib.sha256(body).hexdigest()
           closure=json.loads((receipt/'runquota-closure.json').read_text());rows=closure if isinstance(closure,list) else [dict(value,path=key) for key,value in closure.items()]
           assert any(row['path']==str(package) for row in rows)
-          (receipt/'runquota-identity.json').write_text(json.dumps({'selectedSDK':'413830138a7a73293dfc551d623f7bf2cb0ab62c','lockedRunQuotaInput':node,'system':system,'package':str(package),'drvPath':drv,'imagesSHA256':images,'closureSHA256':hashlib.sha256((receipt/'runquota-closure.json').read_bytes()).hexdigest()},indent=2)+'\n')
+          (receipt/'runquota-identity.json').write_text(json.dumps({'selectedSDK':'9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0','lockedRunQuotaInput':node,'system':system,'package':str(package),'drvPath':drv,'imagesSHA256':images,'closureSHA256':hashlib.sha256((receipt/'runquota-closure.json').read_bytes()).hexdigest()},indent=2)+'\n')
           PY_RUNQUOTA
           printf 'RUNQUOTAD_BIN=%s/bin/runquotad\n' "$runquota_package" >> "$GITHUB_ENV"
           printf '%s/bin\n' "$runquota_package" >> "$GITHUB_PATH"
@@ -168,24 +168,44 @@ jobs:
       # Setup consumes Repro to materialize this environment. Acquire the exact
       # declared Linux package first, including on runners without a release asset.
 
+      # Mint a second installation token immediately before setup-dev-env.
+      # On the Linux lane the Nix build of the reprobuild package above is not
+      # in a binary cache and takes 28-38 minutes, so setup-dev-env can start
+      # more than an hour after the first mint (job 131177548993: its source
+      # clone failed with "could not read Username" on a 61-minute-old token).
+      # The `app-id`/`app-private-key` broker rotates only the Nix credential;
+      # setup-dev-env's Git CLI credential stays `gh-token` and cannot be
+      # rotated while it runs (metacraft-pm issue
+      # 2026-11-12-shared-actions-git-cli-credential-expires-an-hour-after-gh-token-and-the-broker-cannot-rotate-it).
+      # The first token (ci_token) stays for the steps before this one.
+      - name: Mint a fresh installation token for setup-dev-env
+        id: ci_token_setup
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@e2b9947768dccce6de2687a495c8286df4d6de96
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@8ee1026a5d427a7aa5cf8c036fab12cb3d009503
         with:
           env-flavor: reprobuild
           repro-from-source: ${{ matrix.os == 'linux' && 'false' || 'true' }}
-          # Reprobuild v0.2.18. The engine reads the committed v3 lock; older
+          # Reprobuild v0.2.23. The engine reads the committed v3 lock; older
           # engines fail with "unsupported lock schema ...v3 (expected ...v2)".
           # Keep the bootstrap libraries at that engine's own flake-lock
           # revisions. The Linux lane takes the same engine from the exact Nix
           # package bound above.
-          repro-build-pin: 413830138a7a73293dfc551d623f7bf2cb0ab62c
-          repro-runquota-pin: 35b9dfe4af6e18f3f2a2242ece7cff330eb581e2
-          repro-io-mon-pin: 6fccd929cb09da0bfc0844b93ced9ffb1ac0f74f
-          repro-stackable-hooks-pin: 059c549306621e2f769adf75630b0b7f29018dca
-          gh-token: ${{ steps.ci_token.outputs.token }}
+          repro-build-pin: 9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0
+          repro-runquota-pin: 9818dc0c90be8ba7993424a7bbfbb6e009ffa965
+          repro-io-mon-pin: 7a9b2f331024f4bc0b952bcab89b1dc48525d804
+          repro-stackable-hooks-pin: c1d55ce33fb2a29e4cf8d8bdbe1713f355370d0a
+          gh-token: ${{ steps.ci_token_setup.outputs.token }}
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           # Publish repro build outputs to the fleet binary cache (per-repo
           # secrets; org-wide secrets aren't readable in private repos).
           repro-publish-key: ${{ secrets.REPRO_PUBLISH_KEY }}

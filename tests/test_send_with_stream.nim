@@ -141,25 +141,46 @@ proc spawnSilentChild(): NativeStdioAcpTransport =
   result = newChildTransport(scriptPath,
     idleTimeoutMs = 500, hardDeadlineMs = 30_000)
 
+const
+  ## The idle-reset test's timing, derived from three numbers so the
+  ## claim ("the idle timer resets on each frame") does not rest on
+  ## magic values.  Two margins must hold, and both are large because a
+  ## loaded CI runner (macOS arm64 measured 2026-11-12: a 1000 ms margin
+  ## was lost) can stall a ``sleep`` or the pump by well over a second:
+  ##   * every gap is far INSIDE the idle budget (here 2000 ms of
+  ##     slack), so a stalled runner cannot trip the idle timer by
+  ##     accident;
+  ##   * the total is clearly OVER the idle budget (here 4000 ms vs
+  ##     2500 ms), so a transport whose idle timer did NOT reset would
+  ##     have to time out.
+  IdleResetBudgetMs = 2500
+  IdleResetGapMs = 500
+  IdleResetFrames = 8
+  IdleResetTotalMs = IdleResetFrames * IdleResetGapMs
+
+static:
+  doAssert IdleResetBudgetMs - IdleResetGapMs >= 2000,
+    "each gap needs >= 2000 ms of slack inside the idle budget"
+  doAssert IdleResetTotalMs >= IdleResetBudgetMs + 1000,
+    "the total must clearly exceed the idle budget"
+
 proc spawnIdleResetChild(): NativeStdioAcpTransport =
-  ## A child that emits 5 notification frames at 1500 ms gaps, then a
-  ## response.  With the previous wall-clock semantics (1000 ms total
-  ## budget) the second frame would never arrive; under the idle-reset
-  ## semantics the whole stream is delivered.
+  ## A child that emits ``IdleResetFrames`` notification frames at
+  ## ``IdleResetGapMs`` gaps, then a response.  The whole stream takes
+  ## longer than the idle budget; only an idle timer that resets on each
+  ## frame lets it through (a single wall-clock budget of
+  ## ``IdleResetBudgetMs`` would have expired part-way).
   let dir = getTempDir() / ("acp_idle_reset_test_" & $epochTime())
   createDir(dir)
   let scriptPath = dir / "child.sh"
   var body = "read line\n"
-  for _ in 0 ..< 5:
+  for _ in 0 ..< IdleResetFrames:
     body.add "printf '%s\\n' '" & NotificationFrame & "'\n"
-    body.add "sleep 1.5\n"
+    body.add "sleep " & $(IdleResetGapMs / 1000) & "\n"
   body.add "printf '%s\\n' '" & """{"jsonrpc":"2.0","id":"1","result":{"sessionId":"s","stopReason":"end_turn"}}""" & "'\n"
   writeChildScript(scriptPath, body)
-  # ``idleTimeoutMs = 2500`` so each 1500 ms gap stays within budget;
-  # the wall-clock total is ~7500 ms which would have tripped any
-  # historical single-deadline check around 5–6 s.
   result = newChildTransport(scriptPath,
-    idleTimeoutMs = 2500, hardDeadlineMs = 30_000)
+    idleTimeoutMs = IdleResetBudgetMs, hardDeadlineMs = 30_000)
 
 proc spawnNoisyForeverChild(): NativeStdioAcpTransport =
   ## A child that emits a notification frame every ~50 ms and never
@@ -181,10 +202,11 @@ proc spawnNoisyForeverChild(): NativeStdioAcpTransport =
 suite "idle vs hard timeouts (follow-up 1)":
 
   test "test_idle_timeout_resets_on_frame":
-    ## 5 notifications at 1.5 s gaps with a 2.5 s idle budget: all 5
-    ## must arrive and the response must come back normally.  Under the
-    ## pre-follow-up wall-clock semantics this would have failed at
-    ## frame 2 (cumulative ~3 s elapsed > 1 s budget).
+    ## ``IdleResetFrames`` notifications at ``IdleResetGapMs`` gaps with a
+    ## ``IdleResetBudgetMs`` idle budget: every frame must arrive and the
+    ## response must come back normally.  The total exceeds the idle
+    ## budget while each gap stays well inside it, so only a timer that
+    ## resets on each frame passes.
     let transport = spawnIdleResetChild()
     var seen = 0
     let cb: AcpNotificationCallback = proc(raw: string) {.gcsafe.} =
@@ -195,11 +217,11 @@ suite "idle vs hard timeouts (follow-up 1)":
       """{"jsonrpc":"2.0","id":"1","method":"session/prompt","params":{}}""",
       cb)
     let elapsed = epochTime() - start
-    check seen == 5
+    check seen == IdleResetFrames
     check parseJson(resp){"id"}.getStr("") == "1"
-    # We legitimately spent ≥ 5 × 1.5 s ≈ 7.5 s streaming chunks; this
-    # would have been impossible with a 1 s wall-clock budget.
-    check elapsed > 6.0
+    # The stream legitimately took at least the sum of its gaps, which is
+    # more than the idle budget: impossible without the per-frame reset.
+    check elapsed * 1000 > float(IdleResetBudgetMs)
     transport.close()
 
   test "test_idle_timeout_fires_after_silence":

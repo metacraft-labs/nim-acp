@@ -57,7 +57,14 @@ def extract_engine_sources(source, revision, work):
         archive = subprocess.check_output(['git', '-C', str(source), 'archive',
                                             revision, 'libs', 'flake.lock'])
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            tar.extractall(work, filter='data')
+            # The archive is `git archive` output of a pinned, immutable
+            # Reprobuild revision (not untrusted input). Interpreters whose
+            # tarfile predates extraction filters (no `data_filter`) reject
+            # the `filter` keyword, so pass it only where it exists.
+            if hasattr(tarfile, 'data_filter'):
+                tar.extractall(work, filter='data')
+            else:
+                tar.extractall(work)
         return
     shutil.copytree(source / 'libs', work / 'libs')
     shutil.copy(source / 'flake.lock', work / 'flake.lock')
