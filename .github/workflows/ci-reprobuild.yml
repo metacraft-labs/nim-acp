@@ -66,6 +66,15 @@ jobs:
 
       - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         if: runner.os != 'Windows'
+        with:
+          # The pinned reprobuild package below is published to the private
+          # Attic cache by reprobuild's release workflow. Without the
+          # substituter and a pull-capable token this lane reads only
+          # cache.nixos.org and compiles the engine from source (28-38 min).
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
       - name: Bind explicit Linux Repro runtime source
         id: linux_runtime
         if: matrix.os == 'linux'
