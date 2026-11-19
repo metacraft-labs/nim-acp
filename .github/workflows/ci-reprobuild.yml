@@ -96,6 +96,7 @@ jobs:
           package_json="$receipt/package-raw.json"
           "$receipt_python" ci/observe_linux_runtime_build.py --receipt-directory "$receipt" -- nix build --no-link --json --no-update-lock-file 'github:metacraft-labs/reprobuild/84b459adda91535f0b89424dfc95aa34bfa67a32#reprobuild' > "$package_json"
           package="$("$receipt_python" -c 'import json,sys; x=json.load(open(sys.argv[1])); assert len(x)==1; print(x[0]["outputs"]["out"])' "$package_json")"
+          printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
           # A self-hosted runner may retain receipts from earlier jobs. Allocate
           # exclusively and export this job's path without touching prior evidence.
           printf '%s\n' "$receipt_python_out" > "$receipt/python-output.txt"
@@ -175,8 +176,11 @@ jobs:
           retention-days: 7
 
       # Setup consumes Repro to materialize this environment. Acquire the exact
-      # declared Linux package first. Setup then source-builds the same fleet
-      # revision on every leg, so no leg falls back to a release install.
+      # declared Linux package first and hand it to setup as `repro-package`:
+      # setup admits it only if it is the pinned flake's own package output and
+      # then builds nothing, so the Linux legs build the engine once. The other
+      # legs source-build the same fleet revision, so no leg falls back to a
+      # release install.
 
       # Mint a second installation token immediately before setup-dev-env.
       # On the Linux lane the Nix build of the reprobuild package above is not
@@ -200,7 +204,7 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@8ee1026a5d427a7aa5cf8c036fab12cb3d009503
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@b7d0446dd2c8b2cee95b4a39f0ba7551914a4e40
         env:
           WINDOWS_DIY_ARCH_OVERRIDE: ${{ runner.os == 'Windows' && runner.arch == 'ARM64' && 'x64' || '' }}
         with:
@@ -217,6 +221,7 @@ jobs:
           # the companion pins match it.
           repro-from-source: "true"
           repro-build-pin: 84b459adda91535f0b89424dfc95aa34bfa67a32
+          repro-package: ${{ steps.linux_runtime.outputs.package }}
           repro-runquota-pin: f9e1a4d3f3ba7840aefe56883127653af9c5a608
           repro-io-mon-pin: 35829647d603b481276d2632b39ec2a9ce3625b2
           repro-stackable-hooks-pin: c1d55ce33fb2a29e4cf8d8bdbe1713f355370d0a
@@ -248,6 +253,10 @@ jobs:
           git rev-parse HEAD
           command -v repro
           repro --version
+          # The Linux legs must run the receipted package, not another engine.
+          if [ "$RUNNER_OS" = Linux ]; then
+            test "$(command -v repro)" = "$REPROBUILD_REPRO"
+          fi
 
       - name: Report exact Windows Repro environment
         if: runner.os == 'Windows'
