@@ -2,10 +2,16 @@ import std/json
 import std/tables
 import nim_acp/[jsonrpc, types]
 
+const ownedChildTransport = defined(posix) and not defined(wasm32)
+  ## The stdio transport owns its agent through `owned_posix_child` on a
+  ## POSIX host. Not under WebAssembly (`--cpu:wasm32`, Emscripten): its
+  ## libc is POSIX, but it has no process to spawn and no threads to give
+  ## the child's reader, so that transport is not built there.
+
 when not defined(js):
   import std/[atomics, locks, options, os, osproc, streams, strutils, times,
     typetraits]
-  when defined(posix):
+  when ownedChildTransport:
     import std/posix
     import ./owned_posix_child
 
@@ -264,7 +270,7 @@ type
       ## (hard).  Default: 30 minutes.
     when not defined(js):
       process: Process
-      when defined(posix):
+      when ownedChildTransport:
         ownedChild: OwnedPosixChild
       stdinStream: Stream
       stdoutStream: Stream
@@ -645,18 +651,21 @@ when not defined(js):
     var process: Process
     var input: Stream
     var output: Stream
-    when defined(posix):
+    when ownedChildTransport:
       var ownedChild: OwnedPosixChild
     try:
-      when defined(posix):
+      when ownedChildTransport:
         ownedChild = openOwnedPosixChild(resolved, args)
+      elif defined(wasm32):
+        raise newException(OSError,
+          "a WebAssembly build cannot start a process")
       else:
         process = startProcess(resolved, args = args,
           options = {poUsePath})
         input = process.inputStream()
         output = process.outputStream()
     except OSError as e:
-      when defined(posix):
+      when ownedChildTransport:
         if e of OwnedPosixCleanupError: raise
       raise newException(AcpError,
         "NativeStdioAcpTransport: failed to spawn '" & resolved &
@@ -672,16 +681,16 @@ when not defined(js):
       process: process,
       stdinStream: input,
       stdoutStream: output)
-    when defined(posix):
+    when ownedChildTransport:
       result.ownedChild = ownedChild
-    when not defined(posix): initLock(result.writeLock)
+    when not ownedChildTransport: initLock(result.writeLock)
 
   proc hasChild(transport: NativeStdioAcpTransport): bool =
-    when defined(posix): transport.ownedChild.isPresent()
+    when ownedChildTransport: transport.ownedChild.isPresent()
     else: transport.process != nil
 
   proc childAlive(transport: NativeStdioAcpTransport): bool =
-    when defined(posix): transport.ownedChild.isAlive()
+    when ownedChildTransport: transport.ownedChild.isAlive()
     else: transport.process != nil and transport.process.running
 
   proc readByte(transport: NativeStdioAcpTransport): Option[char] =
@@ -695,7 +704,7 @@ when not defined(js):
     ## arrived, defeating the deadline checks entirely.  EAGAIN /
     ## EWOULDBLOCK return ``none(char)``; the loop polls and re-checks
     ## the deadlines.
-    when defined(posix):
+    when ownedChildTransport:
       try:
         return transport.ownedChild.readByte()
       except OwnedPosixClosedError:
@@ -803,7 +812,7 @@ when not defined(js):
         # are bypassed by our non-blocking readByte path, so an
         # ``stdoutStream.readAll`` after exit might not see the bytes
         # the kernel still has queued).
-        when defined(posix):
+        when ownedChildTransport:
           var residualBuf = ""
           while true:
             let next = transport.readByte()
@@ -841,7 +850,7 @@ when not defined(js):
         sleep(5)
 
   proc writeFrame(transport: NativeStdioAcpTransport; payload: string) =
-    when defined(posix):
+    when ownedChildTransport:
       if not transport.childAlive():
         raise newException(AcpTransportClosedError,
           "ACP child '" & transport.command & "' is not running")
@@ -921,7 +930,7 @@ when not defined(js):
   proc close*(transport: NativeStdioAcpTransport) =
     ## POSIX shutdown owns an isolated session/group, not arbitrary detached
     ## descendants. Failed cleanup remains explicit and the transport stays closed.
-    when defined(posix):
+    when ownedChildTransport:
       if transport == nil: return
       transport.ownedChild.close(gracefulMs = 1000, terminalMs = 2000)
     else:
