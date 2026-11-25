@@ -120,7 +120,7 @@ method send*(transport: FakeAcpTransport; request: string): string =
       "jsonrpc": "2.0",
       "id": req.id,
       "result": {
-        "protocolVersion": req.params{"protocolVersion"}.getInt(1),
+        "protocolVersion": req.params{"protocolVersion"}.wireInt32(1),
         "agentCapabilities": {
           "streaming": true,
           "text": true,

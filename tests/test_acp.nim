@@ -125,6 +125,47 @@ suite "nim-acp":
       discard client.sendPrompt(PromptRequest(sessionId: session.sessionId, prompt: @[textBlock("two")]))
 
 
+  # Under the JS target `int` is 32 bits, and std/json's `getInt` raises a
+  # RangeDefect on a wire integer past 2^31-1. An integer JSON-RPC id is an
+  # identity, so it is read in full; a number read into an `int` is held to
+  # the 32-bit range on every target, so native and JS builds agree.
+  test "an integer JSON-RPC id past the int range is read in full":
+    for wire in ["10000000000", "-10000000000"]:
+      let response = decodeResponse("{\"jsonrpc\": \"2.0\", \"id\": " &
+        wire & ", \"result\": {}}")
+      check response.id == wire
+      # `idText` is the reading the native stdio transport matches a
+      # response frame by, too.
+      check parseJson(wire).idText == wire
+    check (%"abc").idText == "abc"
+
+  test "an error code past the int range reads as the 32-bit bound":
+    for (wire, expected) in [("10000000000", int(high(int32))),
+                             ("-10000000000", int(low(int32)))]:
+      let response = decodeResponse("{\"jsonrpc\": \"2.0\", \"id\": 1, " &
+        "\"error\": {\"code\": " & wire & ", \"message\": \"boom\"}}")
+      check response.errorCode == expected
+      check response.errorMessage == "boom"
+
+  test "a protocolVersion past the int range reads as the 32-bit bound":
+    for (wire, expected) in [("10000000000", int(high(int32))),
+                             ("-10000000000", int(low(int32)))]:
+      let answer = "{\"jsonrpc\": \"2.0\", \"id\": \"1\", \"result\": " &
+        "{\"protocolVersion\": " & wire & ", \"agentCapabilities\": {}}}"
+      var client = newAcpClient(proc(request: string): string = answer)
+      let response = client.initialize(InitializeRequest(protocolVersion: 1))
+      check response.protocolVersion == expected
+
+  test "the fake agent echoes a protocolVersion past the int range as the bound":
+    for (wire, expected) in [("10000000000", int(high(int32))),
+                             ("-10000000000", int(low(int32)))]:
+      let fake = newFakeAcpTransport()
+      let answer = parseJson(fake.send("{\"jsonrpc\": \"2.0\", \"id\": \"1\", " &
+        "\"method\": \"initialize\", \"params\": {\"protocolVersion\": " &
+        wire & "}}"))
+      check answer["result"]["protocolVersion"].getBiggestInt == expected
+
+
 suite "session/new provider metadata":
   test "exact optional metadata survives production request encoding":
     var observed: JsonNode

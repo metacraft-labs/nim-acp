@@ -786,10 +786,7 @@ when not defined(js):
         if parsed.hasKey("id") and (parsed.hasKey("result") or
             parsed.hasKey("error")):
           let frameId = parsed["id"]
-          let frameIdText =
-            if frameId.kind == JString: frameId.getStr()
-            elif frameId.kind == JInt: $frameId.getInt()
-            else: $frameId
+          let frameIdText = frameId.idText
           if matchId.len > 0 and frameIdText == matchId:
             return line
           transport.pendingResponses[frameIdText] = line
@@ -875,11 +872,7 @@ when not defined(js):
     let node = parseJson(payload)
     if not node.hasKey("id"):
       return ""
-    let idNode = node["id"]
-    case idNode.kind
-    of JString: idNode.getStr()
-    of JInt: $idNode.getInt()
-    else: $idNode
+    node["id"].idText
 
   method send*(transport: NativeStdioAcpTransport; request: string): string =
     let id = extractRequestId(request)
@@ -1081,7 +1074,7 @@ proc initialize*(client: var AcpClient; req: InitializeRequest): InitializeRespo
     id: client.requestId(), rpcMethod: "initialize", params: params))))
   response.raiseIfError()
   result = InitializeResponse(
-    protocolVersion: response.result{"protocolVersion"}.getInt(1),
+    protocolVersion: response.result{"protocolVersion"}.wireInt32(1),
     agentCapabilities: parseCapabilities(response.result{"agentCapabilities"}),
     rawMeta: response.result{"_meta"})
   # Remember the handshake: optional methods (``session/load``) are

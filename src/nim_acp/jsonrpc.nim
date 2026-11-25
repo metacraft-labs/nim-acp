@@ -18,6 +18,27 @@ type
     rpcMethod*: string
     params*: JsonNode
 
+proc idText*(idNode: JsonNode): JsonRpcId =
+  ## A JSON-RPC `id` node as the text a response is matched by: a string as
+  ## itself, an integer as its full decimal text, anything else as its JSON.
+  ## An integer id is read with `getBiggestInt`, which is 64-bit on every
+  ## target, never with `getInt`: under JS `int` is 32 bits and `getInt`
+  ## raises a RangeDefect on an id past 2^31-1. It is never clamped either,
+  ## since an id is an identity and clamping would merge distinct ids.
+  case idNode.kind
+  of JString: idNode.getStr("")
+  of JInt: $idNode.getBiggestInt
+  else: $idNode
+
+proc wireInt32*(node: JsonNode; default = 0): int =
+  ## A JSON integer read into an `int`, held to the 32-bit range that `int`
+  ## holds on every target, or `default` when `node` is nil or not an integer.
+  ## It is std/json's `getInt` without its RangeDefect: under JS `int` is 32
+  ## bits, and `getInt` raises on a wire value such as `10000000000`, which
+  ## aborted the whole read. Wire readers use it, never `getInt` or `.int`.
+  if node.isNil or node.kind != JInt: default
+  else: int(clamp(node.getBiggestInt.int64, int64(low(int32)), int64(high(int32))))
+
 proc encodeRequest*(req: JsonRpcRequest): string =
   $(%*{"jsonrpc": "2.0", "id": req.id, "method": req.rpcMethod, "params": req.params})
 
@@ -28,12 +49,9 @@ proc decodeResponse*(text: string): JsonRpcResponse =
   let node = parseJson(text)
   let idNode = node{"id"}
   if idNode != nil:
-    case idNode.kind
-    of JString: result.id = idNode.getStr("")
-    of JInt: result.id = $idNode.getInt()
-    else: result.id = $idNode
+    result.id = idNode.idText
   if node.hasKey("error"):
-    result.errorCode = node["error"]{"code"}.getInt(-32000)
+    result.errorCode = node["error"]{"code"}.wireInt32(-32000)
     result.errorMessage = node["error"]{"message"}.getStr("ACP error")
     result.errorData = node["error"]{"data"}
   else:
